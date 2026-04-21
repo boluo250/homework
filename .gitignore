@@ -1,0 +1,28 @@
+.DS_Store
+
+# Local app/runtime state
+.taskmate/
+.tmp_test_runtime/
+.wrangler/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.python-version
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Environment files
+.env
+.env.*
+!.env.example
+.dev.vars
+
+# Coverage and test artifacts
+.coverage
+coverage/
+htmlcov/

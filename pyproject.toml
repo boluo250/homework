@@ -1,0 +1,15 @@
+[project]
+name = "taskmate-homework"
+version = "0.1.0"
+description = "Lightweight Cloudflare Worker MVP for conversational task management"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

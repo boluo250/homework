@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import sys
+import types
+from pathlib import Path
+from typing import Any
+
+# Cloudflare's Python worker loader treats the directory containing the main file
+# as the import root, so `app/entry.py` becomes `entry.py` at runtime. Create a
+# lightweight `app` package alias in that environment so the existing imports
+# continue to work both locally and under `wrangler dev`.
+if __package__ in {None, ""} and "app" not in sys.modules:
+    package = types.ModuleType("app")
+    package.__path__ = [str(Path(__file__).resolve().parent)]
+    sys.modules["app"] = package
+
+from app.core.agent import AssistantAgent
+from app.core.http import HttpRequest, HttpResponse
+from app.providers.embedding_remote import RemoteEmbeddingProvider
+from app.providers.openrouter_chat import OpenRouterChatProvider
+from app.routes.admin import handle_admin_reset
+from app.routes.chat import handle_chat
+from app.routes.files import handle_files
+from app.routes.research import handle_research
+from app.routes.tasks import handle_tasks
+from app.services.cloudflare_d1_repo import CloudflareD1Repository
+from app.services.cloudflare_r2_store import CloudflareR2FileStore
+from app.services.d1_repo import SQLiteAppRepository
+from app.services.file_parser import FileParser
+from app.services.file_service import FileService
+from app.services.memory_service import MemoryService
+from app.services.mistral_document_parse import MistralDocumentParseService
+from app.services.qdrant_store import QdrantStore
+from app.services.r2_store import R2FileStore
+from app.services.rag_service import RagService
+from app.services.research_service import ResearchService
+from app.services.search_service import SearchService
+from app.services.schema_sql import SCHEMA_SQL
+from app.services.web_fetch_service import WebFetchService
+from app.ui_assets import UI_ASSETS
+
+try:
+    from workers import Request, Response, WorkerEntrypoint  # type: ignore
+except ImportError:  # pragma: no cover
+    Request = Any
+
+    class Response:  # pragma: no cover
+        def __init__(self, body: bytes | str, status: int = 200, headers: dict[str, str] | None = None) -> None:
+            self.body = body
+            self.status = status
+            self.headers = headers or {}
+
+    class WorkerEntrypoint:  # pragma: no cover
+        env: Any
+
+
+APP_DIR = Path(__file__).resolve().parent
+WORKSPACE_ROOT = APP_DIR.parent
+DATA_DIR = WORKSPACE_ROOT / ".taskmate"
+_APP_CONTAINER: AppContainer | None = None
+
+
+class AppContainer:
+    def __init__(self, env: Any) -> None:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        migrations_path = WORKSPACE_ROOT / "migrations" / "001_init.sql"
+        if getattr(env, "DB", None):
+            repository = CloudflareD1Repository(env.DB, migrations_sql=SCHEMA_SQL)
+        else:
+            repository = SQLiteAppRepository(
+                db_path=DATA_DIR / "taskmate.db",
+                migrations_path=migrations_path,
+            )
+        embedding_provider = RemoteEmbeddingProvider(
+            api_key=getattr(env, "EMBEDDING_API_KEY", None),
+            model=getattr(env, "EMBEDDING_MODEL", "text-embedding-3-small"),
+            endpoint_url=getattr(env, "EMBEDDING_API_URL", None),
+        )
+        chat_provider = OpenRouterChatProvider(
+            api_key=getattr(env, "OPENROUTER_API_KEY", None),
+            model=getattr(env, "OPENROUTER_MODEL", "openrouter/auto"),
+            app_name=getattr(env, "APP_NAME", "TaskMate"),
+        )
+        search_service = SearchService(api_key=getattr(env, "SERPER_API_KEY", None))
+        qdrant_remote_url = _resolve_qdrant_remote_url(getattr(env, "QDRANT_URL", None))
+        qdrant_store = QdrantStore(
+            storage_path=DATA_DIR / "qdrant_document_chunks.json",
+            remote_url=qdrant_remote_url,
+            api_key=getattr(env, "QDRANT_API_KEY", None),
+        )
+        rag_service = RagService(
+            embedding_provider=embedding_provider,
+            qdrant_store=qdrant_store,
+        )
+        memory_service = MemoryService(
+            embedding_provider=embedding_provider,
+            qdrant_store=qdrant_store,
+        )
+        file_store = (
+            CloudflareR2FileStore(
+                getattr(env, "FILES_BUCKET"),
+                bucket_name=getattr(env, "R2_BUCKET_NAME", "taskmate-homework-files"),
+            )
+            if getattr(env, "FILES_BUCKET", None)
+            else R2FileStore(DATA_DIR / "r2", bucket_name=getattr(env, "R2_BUCKET_NAME", None))
+        )
+        self.repository = repository
+        self.file_service = FileService(
+            repository=repository,
+            file_store=file_store,
+            file_parser=FileParser(),
+            embedding_provider=embedding_provider,
+            qdrant_store=qdrant_store,
+            pdf_parse_service=MistralDocumentParseService(
+                api_key=getattr(env, "MISTRAL_API_KEY", None),
+                model=getattr(env, "MISTRAL_OCR_MODEL", "mistral-ocr-latest"),
+            ),
+        )
+        self.research_service = ResearchService(
+            repository=repository,
+            search_service=search_service,
+            web_fetch_service=WebFetchService(),
+            chat_provider=chat_provider,
+        )
+        self.agent = AssistantAgent(
+            repository=repository,
+            chat_provider=chat_provider,
+            search_service=search_service,
+            rag_service=rag_service,
+            memory_service=memory_service,
+        )
+
+
+def get_container(env: Any) -> AppContainer:
+    global _APP_CONTAINER
+    if _APP_CONTAINER is None:
+        _APP_CONTAINER = AppContainer(env)
+    return _APP_CONTAINER
+
+
+def _load_asset(filename: str) -> str:
+    asset_path = APP_DIR / "ui" / filename
+    try:
+        return asset_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        asset = UI_ASSETS.get(filename)
+        if asset is not None:
+            return asset
+        raise
+
+
+def _resolve_qdrant_remote_url(raw_url: str | None) -> str | None:
+    if not raw_url:
+        return None
+    normalized = raw_url.strip()
+    if not normalized:
+        return None
+    if "your-cluster-id" in normalized:
+        return None
+    return normalized
+
+
+def _with_cors(response: HttpResponse) -> HttpResponse:
+    response.headers.update(
+        {
+            "access-control-allow-origin": "*",
+            "access-control-allow-methods": "GET,POST,DELETE,PATCH,OPTIONS",
+            "access-control-allow-headers": "content-type",
+        }
+    )
+    return response
+
+
+async def route_request(request: HttpRequest, container: AppContainer) -> HttpResponse:
+    if request.method == "OPTIONS":
+        return _with_cors(HttpResponse(status=204))
+    if request.path == "/":
+        return HttpResponse.html(_load_asset("index.html"))
+    if request.path == "/app.js":
+        return HttpResponse(
+            status=200,
+            headers={"content-type": "application/javascript; charset=utf-8"},
+            body=_load_asset("app.js").encode("utf-8"),
+        )
+    if request.path == "/styles.css":
+        return HttpResponse(
+            status=200,
+            headers={"content-type": "text/css; charset=utf-8"},
+            body=_load_asset("styles.css").encode("utf-8"),
+        )
+    if request.path == "/api/chat":
+        return _with_cors(await handle_chat(request, container.agent))
+    if request.path == "/api/tasks":
+        return _with_cors(await handle_tasks(request, container.repository))
+    if request.path == "/api/files":
+        return _with_cors(await handle_files(request, container.repository, container.file_service))
+    if request.path == "/api/research":
+        return _with_cors(await handle_research(request, container.research_service))
+    if request.path == "/api/admin/reset":
+        return _with_cors(
+            await handle_admin_reset(
+                request,
+                container.repository,
+                container.file_service.file_store,
+                container.file_service.qdrant_store,
+            )
+        )
+    return _with_cors(HttpResponse.json({"error": "Not found"}, status=404))
+
+
+class Default(WorkerEntrypoint):
+    async def fetch(self, request: Request) -> Response:
+        body_bytes = b""
+        if hasattr(request, "text"):
+            raw_text = await request.text()
+            body_bytes = raw_text.encode("utf-8") if raw_text else b""
+        headers = dict(getattr(request, "headers", {}) or {})
+        http_request = HttpRequest.from_raw(
+            method=getattr(request, "method", "GET"),
+            url=str(getattr(request, "url", "/")),
+            headers=headers,
+            body=body_bytes,
+        )
+        container = get_container(self.env)
+        response = await route_request(http_request, container)
+        return Response(response.body, status=response.status, headers=response.headers)

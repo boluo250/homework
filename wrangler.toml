@@ -1,0 +1,25 @@
+name = "taskmate-homework"
+main = "app/entry.py"
+compatibility_date = "2026-04-19"
+compatibility_flags = ["python_workers"]
+
+[vars]
+APP_NAME = "TaskMate"
+R2_BUCKET_NAME = "taskmate-homework-files"
+QDRANT_URL = "https://c2746150-b424-42d5-be28-18f2c49db54d.us-east4-0.gcp.cloud.qdrant.io"
+MISTRAL_OCR_MODEL = "mistral-ocr-latest"
+OPENROUTER_MODEL = "moonshotai/kimi-k2.6"
+
+[observability.logs]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "taskmate-homework-db"
+database_id = "04eec7bf-6c15-4c8b-8756-62b97db3a1e1"
+preview_database_id = "04eec7bf-6c15-4c8b-8756-62b97db3a1e1"
+
+[[r2_buckets]]
+binding = "FILES_BUCKET"
+bucket_name = "taskmate-homework-files"
+preview_bucket_name = "taskmate-homework-files-dev"
