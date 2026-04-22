@@ -71,6 +71,32 @@
         <section class="chat-panel">
           <div id="messageList" class="message-list"></div>
 
+          <section id="researchDock" class="research-dock" data-state="idle">
+            <div class="research-dock-header">
+              <div class="research-dock-copy">
+                <p class="eyebrow">Research Run</p>
+                <h3>研究执行进度</h3>
+              </div>
+              <div class="panel-actions">
+                <span id="researchStatusTag" class="badge">idle</span>
+                <button id="copyReportButton" class="ghost-button" type="button">复制报告</button>
+                <button id="exportReportButton" class="ghost-button" type="button">导出 Markdown</button>
+              </div>
+            </div>
+
+            <div class="research-progress-card">
+              <div class="research-progress-topline">
+                <strong id="researchProgressTitle">等待新的研究任务</strong>
+                <span id="researchProgressMeta" class="muted">尚未开始</span>
+              </div>
+              <div class="research-progress-track" aria-hidden="true">
+                <div id="researchProgressFill" class="research-progress-fill"></div>
+              </div>
+            </div>
+
+            <pre id="reportBox" class="report-box">等待研究模式返回结果...</pre>
+          </section>
+
           <form id="chatForm" class="composer">
             <textarea
               id="messageInput"
@@ -79,22 +105,13 @@
               placeholder="试试：帮我创建一个“简历优化”任务，下周五前完成，高优先级"
             ></textarea>
             <div class="composer-footer">
-              <p id="selectedFilesHint" class="muted">当前没有选中的文件上下文</p>
+              <div class="composer-meta">
+                <p id="selectedFilesHint" class="muted">当前没有选中的文件上下文</p>
+                <p class="composer-hint">Enter 发送 · Shift+Enter 换行</p>
+              </div>
               <button type="submit" class="primary-button">发送</button>
             </div>
           </form>
-        </section>
-
-        <section class="panel report-panel">
-          <div class="panel-header">
-            <h2>研究结果区</h2>
-            <div class="panel-actions">
-              <span id="researchStatusTag" class="badge">idle</span>
-              <button id="copyReportButton" class="ghost-button" type="button">复制报告</button>
-              <button id="exportReportButton" class="ghost-button" type="button">导出 Markdown</button>
-            </div>
-          </div>
-          <pre id="reportBox" class="report-box">等待研究模式返回结果...</pre>
         </section>
       </main>
     </div>

@@ -11,7 +11,7 @@ INDEX_HTML = """<!doctype html>
       <aside class="sidebar">
         <div class="brand-card">
           <p class="eyebrow">Cloudflare Worker MVP</p>
-          <h1>TaskMate</h1>
+          <h1 id="assistantBrand">TaskMate</h1>
           <p class="brand-lead">把任务管理、研究模式和文件问答收进同一块清晰的工作台。</p>
           <p class="muted">一个面向面试作业的轻量任务、研究与文件问答助手。</p>
           <div class="brand-metrics">
@@ -46,7 +46,7 @@ INDEX_HTML = """<!doctype html>
           </div>
           <p class="section-note">上传资料后，可以把选中的文件作为聊天上下文直接参与问答。</p>
           <form id="uploadForm" class="upload-form">
-            <input id="fileInput" type="file" accept=".txt,.md,.pdf,.docx" />
+            <input id="fileInput" type="file" accept=".txt,.md,.pdf,.docx,.png,.jpg,.jpeg" />
             <button type="submit" class="ghost-button">上传文件</button>
           </form>
           <p id="uploadStatus" class="muted">支持 txt、md、pdf、docx、png、jpg、jpeg，单文件最大 10MB。</p>
@@ -71,6 +71,32 @@ INDEX_HTML = """<!doctype html>
         <section class="chat-panel">
           <div id="messageList" class="message-list"></div>
 
+          <section id="researchDock" class="research-dock" data-state="idle">
+            <div class="research-dock-header">
+              <div class="research-dock-copy">
+                <p class="eyebrow">Research Run</p>
+                <h3>研究执行进度</h3>
+              </div>
+              <div class="panel-actions">
+                <span id="researchStatusTag" class="badge">idle</span>
+                <button id="copyReportButton" class="ghost-button" type="button">复制报告</button>
+                <button id="exportReportButton" class="ghost-button" type="button">导出 Markdown</button>
+              </div>
+            </div>
+
+            <div class="research-progress-card">
+              <div class="research-progress-topline">
+                <strong id="researchProgressTitle">等待新的研究任务</strong>
+                <span id="researchProgressMeta" class="muted">尚未开始</span>
+              </div>
+              <div class="research-progress-track" aria-hidden="true">
+                <div id="researchProgressFill" class="research-progress-fill"></div>
+              </div>
+            </div>
+
+            <pre id="reportBox" class="report-box">等待研究模式返回结果...</pre>
+          </section>
+
           <form id="chatForm" class="composer">
             <textarea
               id="messageInput"
@@ -79,18 +105,13 @@ INDEX_HTML = """<!doctype html>
               placeholder="试试：帮我创建一个“简历优化”任务，下周五前完成，高优先级"
             ></textarea>
             <div class="composer-footer">
-              <p id="selectedFilesHint" class="muted">当前没有选中的文件上下文</p>
+              <div class="composer-meta">
+                <p id="selectedFilesHint" class="muted">当前没有选中的文件上下文</p>
+                <p class="composer-hint">Enter 发送 · Shift+Enter 换行</p>
+              </div>
               <button type="submit" class="primary-button">发送</button>
             </div>
           </form>
-        </section>
-
-        <section class="panel report-panel">
-          <div class="panel-header">
-            <h2>研究结果区</h2>
-            <span id="researchStatusTag" class="badge">idle</span>
-          </div>
-          <pre id="reportBox" class="report-box">等待研究模式返回结果...</pre>
         </section>
       </main>
     </div>
@@ -106,7 +127,6 @@ INDEX_HTML = """<!doctype html>
   </body>
 </html>
 """
-
 STYLES_CSS = """:root {
   --bg-top: #f6efe6;
   --bg-bottom: #f1f5ef;
@@ -215,7 +235,7 @@ body::before {
 .chat-panel {
   display: flex;
   flex-direction: column;
-  min-height: 680px;
+  min-height: 760px;
 }
 
 .brand-card {
@@ -311,6 +331,14 @@ h2 {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .hero {
@@ -412,7 +440,7 @@ h2 {
 }
 
 .message-list {
-  min-height: 460px;
+  min-height: 280px;
   max-height: 60vh;
   overflow: auto;
   padding: 26px;
@@ -454,6 +482,12 @@ h2 {
   align-self: flex-start;
 }
 
+.message[data-thinking="true"] {
+  background:
+    radial-gradient(circle at top right, rgba(59, 124, 112, 0.12), transparent 28%),
+    linear-gradient(145deg, rgba(255, 255, 255, 0.96), rgba(244, 249, 247, 0.92));
+}
+
 .message-meta {
   margin-bottom: 8px;
   font-size: 12px;
@@ -467,6 +501,41 @@ h2 {
   white-space: pre-wrap;
   line-height: 1.72;
   color: var(--ink);
+}
+
+.thinking-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 28px;
+}
+
+.thinking-label {
+  font-weight: 600;
+  color: var(--muted-strong);
+}
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.typing-dots span {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--accent), #7f66ff);
+  opacity: 0.28;
+  animation: thinkingPulse 1.1s ease-in-out infinite;
+}
+
+.typing-dots span:nth-child(2) {
+  animation-delay: 0.14s;
+}
+
+.typing-dots span:nth-child(3) {
+  animation-delay: 0.28s;
 }
 
 .composer {
@@ -525,17 +594,96 @@ input[type="file"]::file-selector-button {
   align-items: flex-end;
 }
 
+.composer-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .composer-footer .muted {
   margin-bottom: 0;
 }
 
-.report-panel {
-  min-height: 280px;
+.composer-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+}
+
+.research-dock {
+  margin: 0 16px;
+  padding: 14px 16px 16px;
+  border-radius: 24px;
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(circle at top right, rgba(200, 91, 61, 0.1), transparent 24%),
+    linear-gradient(180deg, rgba(255, 252, 247, 0.9), rgba(250, 252, 249, 0.74));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.82);
+}
+
+.research-dock-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.research-dock-copy h3 {
+  margin: 0;
+  font-size: 17px;
+  letter-spacing: -0.02em;
+}
+
+.research-dock-copy .eyebrow {
+  margin-bottom: 6px;
+}
+
+.research-progress-card {
+  padding: 12px 14px;
+  border-radius: 20px;
+  border: 1px solid rgba(24, 33, 38, 0.08);
+  background: rgba(255, 255, 255, 0.66);
+  box-shadow: var(--shadow-sm);
+}
+
+.research-progress-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.research-progress-topline strong {
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.research-progress-track {
+  position: relative;
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(24, 33, 38, 0.08);
+}
+
+.research-progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background:
+    linear-gradient(90deg, rgba(200, 91, 61, 0.94), rgba(59, 124, 112, 0.9));
+  box-shadow: 0 0 24px rgba(200, 91, 61, 0.22);
+  transition: width 220ms ease;
 }
 
 .report-box {
-  min-height: 240px;
-  margin: 0;
+  min-height: 180px;
+  max-height: 280px;
+  margin: 12px 0 0;
   padding: 20px;
   border-radius: 22px;
   background:
@@ -587,6 +735,12 @@ input[type="file"]::file-selector-button {
   align-items: flex-start;
   justify-content: space-between;
   gap: 14px;
+}
+
+.file-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .file-select {
@@ -644,6 +798,20 @@ input[type="file"]::file-selector-button {
   margin-bottom: 12px;
 }
 
+.research-dock .ghost-button {
+  min-height: 30px;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border-color: rgba(24, 33, 38, 0.06);
+  background: rgba(255, 255, 255, 0.5);
+  box-shadow: none;
+}
+
+.research-dock .ghost-button:hover {
+  background: rgba(255, 255, 255, 0.78);
+}
+
 .empty-state {
   justify-content: center;
   min-height: 108px;
@@ -652,6 +820,19 @@ input[type="file"]::file-selector-button {
   border-radius: 20px;
   color: var(--muted);
   background: rgba(255, 255, 255, 0.38);
+}
+
+@keyframes thinkingPulse {
+  0%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.28;
+  }
+
+  50% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
 }
 
 @media (max-width: 1180px) {
@@ -712,6 +893,12 @@ input[type="file"]::file-selector-button {
     align-items: stretch;
   }
 
+  .research-dock-header,
+  .research-progress-topline {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
   .file-select {
     width: 100%;
   }
@@ -720,53 +907,97 @@ input[type="file"]::file-selector-button {
     flex-direction: column;
     align-items: stretch;
   }
+
+  .research-dock,
+  .composer {
+    margin: 12px;
+  }
 }
 """
-
 APP_JS = """const storageKeys = {
   clientId: "taskmate-client-id",
   conversationId: "taskmate-conversation-id",
+  assistantName: "taskmate-assistant-name",
 };
+
+const RESEARCH_POLL_INTERVAL_MS = 2000;
+const RESEARCH_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+const RESEARCH_POLL_MAX_ATTEMPTS = Math.ceil(RESEARCH_POLL_TIMEOUT_MS / RESEARCH_POLL_INTERVAL_MS);
 
 const state = {
   clientId: loadOrCreateClientId(),
   conversationId: localStorage.getItem(storageKeys.conversationId) || "",
+  assistantName: localStorage.getItem(storageKeys.assistantName) || "TaskMate",
   selectedFileIds: new Set(),
   researchJobId: "",
+  researchMessageId: "",
+  isComposing: false,
 };
 
 const dom = {
   chatForm: document.getElementById("chatForm"),
+  submitButton: document.querySelector("#chatForm .primary-button"),
   messageInput: document.getElementById("messageInput"),
   messageList: document.getElementById("messageList"),
   taskList: document.getElementById("taskList"),
   fileList: document.getElementById("fileList"),
+  researchDock: document.getElementById("researchDock"),
   reportBox: document.getElementById("reportBox"),
+  researchProgressTitle: document.getElementById("researchProgressTitle"),
+  researchProgressMeta: document.getElementById("researchProgressMeta"),
+  researchProgressFill: document.getElementById("researchProgressFill"),
   refreshTasksButton: document.getElementById("refreshTasksButton"),
   newConversationButton: document.getElementById("newConversationButton"),
   resetDataButton: document.getElementById("resetDataButton"),
   clientIdTag: document.getElementById("clientIdTag"),
+  assistantBrand: document.getElementById("assistantBrand"),
   messageTemplate: document.getElementById("messageTemplate"),
   uploadForm: document.getElementById("uploadForm"),
   fileInput: document.getElementById("fileInput"),
   uploadStatus: document.getElementById("uploadStatus"),
   researchStatusTag: document.getElementById("researchStatusTag"),
   selectedFilesHint: document.getElementById("selectedFilesHint"),
+  copyReportButton: document.getElementById("copyReportButton"),
+  exportReportButton: document.getElementById("exportReportButton"),
 };
 
 dom.clientIdTag.textContent = `client_id: ${state.clientId}`;
-appendMessage("assistant", "你好，我已经准备好接住任务、普通对话、研究请求和文件问答了。");
-refreshTasks();
-refreshFiles();
-renderSelectedFilesHint();
+applyAssistantIdentity(state.assistantName);
+renderResearchState({ status: "idle", report_markdown: "等待研究模式返回结果..." });
+initializeWorkspace();
 
 dom.chatForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  await submitChat();
+});
+
+dom.messageInput.addEventListener("compositionstart", () => {
+  state.isComposing = true;
+});
+
+dom.messageInput.addEventListener("compositionend", () => {
+  state.isComposing = false;
+});
+
+dom.messageInput.addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing || state.isComposing) {
+    return;
+  }
+  event.preventDefault();
+  await submitChat();
+});
+
+async function submitChat() {
   const message = dom.messageInput.value.trim();
   if (!message) return;
 
   appendMessage("user", message);
   dom.messageInput.value = "";
+  const pendingMessageId = appendMessage("assistant", "", {
+    thinking: true,
+    thinkingLabel: pendingChatLabel(message),
+  });
+  setComposerBusy(true);
 
   try {
     const response = await fetch("/api/chat", {
@@ -786,7 +1017,10 @@ dom.chatForm.addEventListener("submit", async (event) => {
 
     state.conversationId = payload.conversation_id;
     localStorage.setItem(storageKeys.conversationId, state.conversationId);
-    appendMessage("assistant", payload.reply);
+    if (payload.assistant_name) {
+      applyAssistantIdentity(payload.assistant_name);
+    }
+    updateMessage(pendingMessageId, payload.reply);
 
     await refreshTasks(payload.user_profile?.id);
     await refreshFiles();
@@ -795,9 +1029,11 @@ dom.chatForm.addEventListener("submit", async (event) => {
       await submitResearchJob(message);
     }
   } catch (error) {
-    appendMessage("assistant", `请求失败：${error.message}`);
+    updateMessage(pendingMessageId, `请求失败：${error.message}`);
+  } finally {
+    setComposerBusy(false);
   }
-});
+}
 
 dom.refreshTasksButton.addEventListener("click", async () => {
   await refreshTasks();
@@ -808,6 +1044,25 @@ dom.newConversationButton.addEventListener("click", () => {
   localStorage.removeItem(storageKeys.conversationId);
   dom.messageList.innerHTML = "";
   appendMessage("assistant", "已经为你开启一个新会话。");
+});
+
+dom.copyReportButton.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(dom.reportBox.textContent || "");
+    setResearchStatus("copied");
+  } catch (_error) {
+    setResearchStatus("copy_failed");
+  }
+});
+
+dom.exportReportButton.addEventListener("click", () => {
+  const blob = new Blob([dom.reportBox.textContent || ""], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `taskmate-research-${Date.now()}.md`;
+  anchor.click();
+  URL.revokeObjectURL(url);
 });
 
 dom.resetDataButton.addEventListener("click", async () => {
@@ -831,8 +1086,7 @@ dom.resetDataButton.addEventListener("click", async () => {
     localStorage.removeItem(storageKeys.conversationId);
     dom.messageList.innerHTML = "";
     appendMessage("assistant", "数据已经清空。现在可以重新上传文件并从干净状态开始测试。");
-    dom.reportBox.textContent = "等待研究模式返回结果..."
-    dom.researchStatusTag.textContent = "idle";
+    renderResearchState({ status: "idle", report_markdown: "等待研究模式返回结果..." });
     dom.uploadStatus.textContent = `已清空数据，R2 删除 ${payload.deleted_r2_count} 个文件。`;
     await refreshTasks();
     await refreshFiles();
@@ -852,7 +1106,9 @@ dom.uploadForm.addEventListener("submit", async (event) => {
 
   dom.uploadStatus.textContent = `正在上传 ${file.name}...`;
   try {
+    dom.uploadStatus.textContent = `正在读取 ${file.name}...`;
     const contentBase64 = await readFileAsBase64(file);
+    dom.uploadStatus.textContent = `正在上传 ${file.name} 到 Worker...`;
     const response = await fetch("/api/files", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -867,7 +1123,7 @@ dom.uploadForm.addEventListener("submit", async (event) => {
     if (!response.ok) {
       throw new Error(payload.error || "Upload failed");
     }
-    dom.uploadStatus.textContent = `上传完成：${payload.file.filename}，共切分 ${payload.chunk_count} 个片段，Qdrant 已写入 ${payload.vector_count} 条向量。`;
+    dom.uploadStatus.textContent = `解析与向量化完成：${payload.file.filename}，共切分 ${payload.chunk_count} 个片段，Qdrant 已写入 ${payload.vector_count} 条向量。`;
     dom.fileInput.value = "";
     await refreshFiles(payload.user_id);
   } catch (error) {
@@ -901,8 +1157,10 @@ async function refreshTasks(userId = "") {
         <strong>${escapeHtml(task.title)}</strong>
         <span class="badge">${task.priority}</span>
       </div>
-      <p class="muted">status: ${task.status}</p>
+      ${task.details ? `<p class="muted">${escapeHtml(task.details)}</p>` : ""}
+      <p class="muted">status: ${statusLabel(task.status)}</p>
       <p class="muted">due: ${task.due_at || "n/a"}</p>
+      <p class="muted">updated: ${formatDate(task.updated_at)}</p>
     `;
     dom.taskList.appendChild(card);
   }
@@ -945,6 +1203,7 @@ async function refreshFiles(userId = "") {
         </div>
       </label>
       <div class="file-actions">
+        <button class="ghost-button" type="button" data-rename-file-id="${escapeHtml(file.id)}">重命名</button>
         <button class="inline-danger" type="button" data-delete-file-id="${escapeHtml(file.id)}">删除文件</button>
       </div>
     `;
@@ -970,7 +1229,39 @@ async function refreshFiles(userId = "") {
     });
   });
 
+  dom.fileList.querySelectorAll("[data-rename-file-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const fileId = button.dataset.renameFileId;
+      const currentName = button.closest(".file-card")?.querySelector("strong")?.textContent || "";
+      const nextName = window.prompt("输入新的文件名（需保持扩展名不变）", currentName);
+      if (!nextName || nextName === currentName) {
+        return;
+      }
+      await renameFile(fileId, nextName);
+    });
+  });
+
   renderSelectedFilesHint();
+}
+
+async function renameFile(fileId, filename) {
+  dom.uploadStatus.textContent = `正在重命名为 ${filename}...`;
+  const response = await fetch("/api/files", {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_id: state.clientId,
+      file_id: fileId,
+      filename,
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    dom.uploadStatus.textContent = `重命名失败：${payload.error || "Unknown error"}`;
+    return;
+  }
+  dom.uploadStatus.textContent = `已重命名文件：${payload.file.filename}`;
+  await refreshFiles();
 }
 
 async function deleteFile(fileId) {
@@ -989,8 +1280,20 @@ async function deleteFile(fileId) {
 }
 
 async function submitResearchJob(query) {
-  dom.researchStatusTag.textContent = "pending";
-  dom.reportBox.textContent = "研究任务已提交，正在轮询结果...";
+  const messageId = `research_${crypto.randomUUID().slice(0, 8)}`;
+  state.researchMessageId = messageId;
+  renderResearchState({
+    status: "pending",
+    phase: "pending",
+    current_step: 0,
+    total_steps: 0,
+    report_markdown: "研究任务已提交，正在建立检索计划...",
+  });
+  appendMessage("assistant", "", {
+    messageId,
+    thinking: true,
+    thinkingLabel: researchThinkingLabel("pending"),
+  });
   const response = await fetch("/api/research", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1001,39 +1304,84 @@ async function submitResearchJob(query) {
   });
   const payload = await response.json();
   if (!response.ok) {
-    dom.researchStatusTag.textContent = "failed";
-    dom.reportBox.textContent = payload.error || "研究任务提交失败";
+    renderResearchState({
+      status: "failed",
+      phase: "failed",
+      report_markdown: payload.error || "研究任务提交失败",
+    });
+    updateMessage(messageId, payload.error || "研究任务提交失败，请稍后重试。");
     return;
   }
   state.researchJobId = payload.id;
-  pollResearchJob(payload.id);
+  renderResearchState(payload);
+  await pollResearchJob(payload.id, messageId);
 }
 
-async function pollResearchJob(jobId) {
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    await delay(3000);
+async function pollResearchJob(jobId, messageId) {
+  for (let attempt = 0; attempt < RESEARCH_POLL_MAX_ATTEMPTS; attempt += 1) {
+    await delay(RESEARCH_POLL_INTERVAL_MS);
     const response = await fetch(`/api/research?job_id=${encodeURIComponent(jobId)}`);
     const payload = await response.json();
-    dom.researchStatusTag.textContent = payload.status;
+    const phase = payload.phase || payload.state?.phase || payload.status;
+    renderResearchState(payload);
+    updateMessage(messageId, "", {
+      thinking: payload.status !== "completed" && payload.status !== "failed",
+      thinkingLabel: researchThinkingLabel(phase),
+    });
     if (payload.status === "completed" || payload.status === "failed") {
-      dom.reportBox.textContent = payload.report_markdown || "无结果";
+      if (payload.status === "completed") {
+        updateMessage(messageId, "研究完成了。我已经把完整报告写进当前对话面板里的研究卡片，你可以继续追问其中任意一个子结论。");
+      } else {
+        updateMessage(messageId, "这次研究执行失败了。错误信息我已经同步到当前对话面板里的研究卡片。");
+      }
+      state.researchJobId = "";
       return;
     }
-    const step = payload.current_step ?? "?";
-    const total = payload.total_steps ?? "?";
-    dom.reportBox.textContent = `研究中... 状态：${payload.status}  步骤：${step}/${total}`;
   }
-  dom.researchStatusTag.textContent = "timeout";
-  dom.reportBox.textContent = "轮询超时，请稍后手动刷新研究结果接口。";
+  renderResearchState({
+    status: "timeout",
+    phase: "timeout",
+    report_markdown: "自动轮询已持续 5 分钟，前端先停止等待。研究如果仍在后台执行，你可以稍后继续查看结果。",
+  });
+  updateMessage(messageId, "我已经持续轮询了 5 分钟。前端先停止自动等待，但如果后台还在跑，稍后再进入页面或继续发消息时仍可以继续查看结果。");
 }
 
-function appendMessage(role, content) {
+function appendMessage(role, content, options = {}) {
   const node = dom.messageTemplate.content.firstElementChild.cloneNode(true);
   node.dataset.role = role;
-  node.querySelector(".message-meta").textContent = role === "user" ? "你" : "TaskMate";
-  node.querySelector(".message-body").textContent = content;
+  node.dataset.messageId = options.messageId || `msg_${crypto.randomUUID().slice(0, 8)}`;
+  node.querySelector(".message-meta").textContent = role === "user" ? "你" : state.assistantName;
+  setMessageContent(node, content, options);
   dom.messageList.appendChild(node);
   dom.messageList.scrollTop = dom.messageList.scrollHeight;
+  return node.dataset.messageId;
+}
+
+function updateMessage(messageId, content, options = {}) {
+  const node = Array.from(dom.messageList.querySelectorAll(".message")).find(
+    (item) => item.dataset.messageId === messageId,
+  );
+  if (!node) return;
+  setMessageContent(node, content, options);
+  dom.messageList.scrollTop = dom.messageList.scrollHeight;
+}
+
+function setMessageContent(node, content, options = {}) {
+  const body = node.querySelector(".message-body");
+  if (options.thinking) {
+    node.dataset.thinking = "true";
+    body.innerHTML = `
+      <div class="thinking-line">
+        <span class="thinking-label">${escapeHtml(options.thinkingLabel || "正在思考")}</span>
+        <span class="typing-dots" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+      </div>
+    `;
+    return;
+  }
+  delete node.dataset.thinking;
+  body.textContent = content;
 }
 
 function renderSelectedFilesHint() {
@@ -1050,6 +1398,172 @@ function loadOrCreateClientId() {
   const next = `client_${crypto.randomUUID().slice(0, 12)}`;
   localStorage.setItem(storageKeys.clientId, next);
   return next;
+}
+
+async function initializeWorkspace() {
+  appendMessage("assistant", `你好，我是 ${state.assistantName}，我已经准备好接住任务、研究请求和文件问答了。`);
+  appendMessage(
+    "assistant",
+    "首次使用建议：先告诉我你的名字和邮箱，再试试创建一个带具体要求的任务、上传一份文件，或者发起一个研究主题。",
+  );
+  await refreshSessionMeta();
+  await refreshTasks();
+  await refreshFiles();
+  renderSelectedFilesHint();
+}
+
+async function refreshSessionMeta() {
+  try {
+    const response = await fetch(`/api/chat?client_id=${encodeURIComponent(state.clientId)}`);
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || "Load session failed");
+    }
+    if (payload.assistant_name) {
+      applyAssistantIdentity(payload.assistant_name);
+    }
+    if (!payload.user_profile?.name || !payload.user_profile?.email) {
+      appendMessage("assistant", "开始之前，先把你的名字和邮箱告诉我，我会在后续对话里持续记住。");
+    }
+  } catch (_error) {
+    // Keep the optimistic local identity if session bootstrap fails.
+  }
+}
+
+function applyAssistantIdentity(name) {
+  state.assistantName = name || "TaskMate";
+  localStorage.setItem(storageKeys.assistantName, state.assistantName);
+  document.title = `${state.assistantName} Worker Demo`;
+  if (dom.assistantBrand) {
+    dom.assistantBrand.textContent = state.assistantName;
+  }
+}
+
+function setComposerBusy(isBusy) {
+  if (dom.submitButton) {
+    dom.submitButton.disabled = isBusy;
+    dom.submitButton.textContent = isBusy ? "处理中..." : "发送";
+  }
+  dom.messageInput.disabled = isBusy;
+}
+
+function pendingChatLabel(message) {
+  const lowered = message.toLowerCase();
+  if (state.selectedFileIds.size > 0 || /文档|文件|pdf|docx|总结|概括|归纳/.test(message)) {
+    return "正在整理文件内容";
+  }
+  if (/研究|调研|对比|方案|报告|分析/.test(message)) {
+    return "正在准备研究计划";
+  }
+  if (/任务|待办|todo|提醒/.test(lowered) || /任务|待办|提醒/.test(message)) {
+    return "正在处理任务请求";
+  }
+  return "正在思考";
+}
+
+function setResearchStatus(status) {
+  dom.researchStatusTag.textContent = researchStatusLabel(status);
+  if (dom.researchDock) {
+    dom.researchDock.dataset.state = status || "idle";
+  }
+}
+
+function renderResearchState(payload = {}) {
+  const phase = payload.phase || payload.state?.phase || payload.status || "idle";
+  const status = payload.status || phase || "idle";
+  const currentStep = Number(payload.current_step ?? payload.state?.current_step ?? 0);
+  const totalSteps = Number(payload.total_steps ?? payload.state?.total_steps ?? 0);
+  const percent = researchProgressPercent({ status, phase, currentStep, totalSteps });
+  const title = researchProgressTitle({ status, phase, currentStep, totalSteps });
+  const meta = researchProgressMeta({ status, phase, currentStep, totalSteps, percent });
+  const reportText = payload.report_markdown || (status === "idle" ? "等待研究模式返回结果..." : dom.reportBox.textContent);
+
+  setResearchStatus(phase);
+  dom.researchProgressTitle.textContent = title;
+  dom.researchProgressMeta.textContent = meta;
+  dom.researchProgressFill.style.width = `${percent}%`;
+  dom.reportBox.textContent = reportText;
+}
+
+function researchProgressPercent({ status, phase, currentStep, totalSteps }) {
+  if (status === "completed") return 100;
+  if (status === "failed") {
+    return totalSteps > 0 ? Math.max(12, Math.round((currentStep / totalSteps) * 100)) : 100;
+  }
+  if (status === "timeout") return 100;
+  if (status === "pending") return 6;
+  if (phase === "synthesizing") {
+    return totalSteps > 0 ? Math.min(98, Math.round(((Math.max(currentStep, totalSteps - 0.25)) / totalSteps) * 100)) : 88;
+  }
+  if (phase === "searching") {
+    return totalSteps > 0 ? Math.min(94, Math.round(((currentStep + 0.55) / totalSteps) * 100)) : 28;
+  }
+  if (phase === "queued") {
+    return totalSteps > 0 ? Math.max(8, Math.round((currentStep / totalSteps) * 100)) : 8;
+  }
+  return 0;
+}
+
+function researchProgressTitle({ status, phase, currentStep, totalSteps }) {
+  if (status === "completed") return "研究完成，报告已生成";
+  if (status === "failed") return "研究执行失败";
+  if (status === "timeout") return "前端已停止自动轮询";
+  if (status === "pending") return "研究任务已提交，正在建立计划";
+  if (phase === "synthesizing") return "正在汇总最终报告";
+  if (phase === "searching" && totalSteps > 0) {
+    return `正在执行第 ${Math.min(currentStep + 1, totalSteps)} / ${totalSteps} 步`;
+  }
+  if (phase === "queued" && totalSteps > 0) {
+    return `已完成 ${currentStep} / ${totalSteps} 步，准备进入下一阶段`;
+  }
+  return "等待新的研究任务";
+}
+
+function researchProgressMeta({ status, phase, currentStep, totalSteps, percent }) {
+  if (status === "idle") return "尚未开始";
+  if (totalSteps > 0) {
+    return `${researchStatusLabel(phase)} · ${currentStep}/${totalSteps} · ${percent}%`;
+  }
+  return `${researchStatusLabel(phase)} · ${percent}%`;
+}
+
+function researchStatusLabel(status) {
+  const labels = {
+    idle: "idle",
+    queued: "排队中",
+    pending: "已提交",
+    planning: "规划中",
+    searching: "检索中",
+    reading: "阅读中",
+    synthesizing: "汇总中",
+    completed: "已完成",
+    failed: "失败",
+    timeout: "超时",
+    copied: "已复制",
+    copy_failed: "复制失败",
+  };
+  return labels[status] || status;
+}
+
+function researchThinkingLabel(status) {
+  const labels = {
+    queued: "正在等待后台消费者接手",
+    pending: "正在接住研究任务",
+    planning: "正在拆解研究问题",
+    searching: "正在搜索网页资料",
+    reading: "正在阅读和整理证据",
+    synthesizing: "正在汇总结论与建议",
+  };
+  return labels[status] || "正在研究中";
+}
+
+function escapeHtml(input) {
+  return String(input)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function readFileAsBase64(file) {
@@ -1072,11 +1586,25 @@ function guessContentType(filename) {
   if (filename.endsWith(".docx")) {
     return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
   }
+  if (filename.endsWith(".png")) return "image/png";
+  if (filename.endsWith(".jpg") || filename.endsWith(".jpeg")) return "image/jpeg";
   return "application/octet-stream";
 }
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatDate(value) {
+  if (!value) return "n/a";
+  return value.replace("T", " ").replace("+00:00", " UTC");
+}
+
+function statusLabel(value) {
+  if (value === "todo") return "待办";
+  if (value === "in_progress") return "进行中";
+  if (value === "done") return "已完成";
+  return value || "unknown";
 }
 
 function escapeHtml(value) {
@@ -1088,7 +1616,6 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 """
-
 UI_ASSETS = {
     "index.html": INDEX_HTML,
     "styles.css": STYLES_CSS,

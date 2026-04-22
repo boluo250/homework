@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from app.core.agent import AssistantAgent
 from app.core.models import ChatRequest
@@ -51,6 +52,18 @@ class FakeChatProvider(ChatProviderBase):
             "## 参考来源\n\n"
             "- [Example](https://example.com/a)\n"
         )
+
+
+class SlowChatProvider(ChatProviderBase):
+    async def chat(self, *, system_prompt: str, user_message: str) -> str:
+        await asyncio.sleep(0.02)
+        return "# 永远不该看到这段"
+
+
+class HangingChatProvider(ChatProviderBase):
+    async def chat(self, *, system_prompt: str, user_message: str) -> str:
+        await asyncio.Future()
+        return "# 不会执行到这里"
 
 
 class FakeQueueBinding:
@@ -117,6 +130,32 @@ def test_research_service_queue_mode_persists_state_and_completes() -> None:
     asyncio.run(run())
 
 
+def test_research_service_falls_back_when_synthesis_times_out() -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        service = ResearchService(
+            repository=repository,
+            search_service=FakeSearchService(),
+            web_fetch_service=FakeWebFetchService(),
+            chat_provider=SlowChatProvider(),
+        )
+        service.agent.SYNTHESIS_TIMEOUT_SECONDS = 0.001
+        job = await service.submit(client_id="client_research_timeout", query="Cloudflare Worker 上做 RAG 的轻量实现方案")
+        while True:
+            current = await service.get(job["id"])
+            if current and current["status"] in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0)
+        assert current is not None
+        assert current["status"] == "completed"
+        report = current["report_markdown"] or ""
+        assert "## 执行摘要" in report
+        assert "## 推荐方案" in report
+        assert "永远不该看到这段" not in report
+
+    asyncio.run(run())
+
+
 def test_research_service_get_resumes_stalled_queue_job_without_consumer() -> None:
     async def run() -> None:
         repository = InMemoryAppRepository()
@@ -141,6 +180,74 @@ def test_research_service_get_resumes_stalled_queue_job_without_consumer() -> No
         assert current["status"] == "completed"
         assert current["phase"] == "completed"
         assert current["current_step"] == current["total_steps"]
+
+    asyncio.run(run())
+
+
+def test_research_service_get_finishes_stalled_synthesizing_job_with_fallback() -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        service = ResearchService(
+            repository=repository,
+            search_service=FakeSearchService(),
+            web_fetch_service=FakeWebFetchService(),
+            chat_provider=HangingChatProvider(),
+            synthesis_stall_timeout_seconds=0,
+        )
+        user = await repository.get_or_create_user("client_research_stalled_synthesis")
+        job = await repository.create_research_job(user.id, "Cloudflare Worker 上做 RAG 的轻量实现方案")
+        plan = service.agent.build_plan(job.query)
+        findings = [
+            {
+                "step": {
+                    "title": plan[0].title,
+                    "objective": plan[0].objective,
+                    "search_queries": plan[0].search_queries,
+                },
+                "sources": [
+                    {
+                        "title": "Example result",
+                        "url": "https://example.com/a",
+                        "snippet": "关于实现路径和约束的摘要。",
+                        "excerpt": "正文内容，包含 Cloudflare Worker、RAG 和 tradeoff 分析。",
+                        "domain": "example.com",
+                        "search_query": plan[0].search_queries[0],
+                    }
+                ],
+                "findings": ["- Example result（example.com）：Cloudflare Worker 适合轻量 RAG 闭环。"],
+            }
+        ]
+        references = [{"title": "Example result", "url": "https://example.com/a"}]
+        await repository.update_research_job(job.id, status="running", report_markdown="正在汇总")
+        await repository.create_research_job_state(
+            job.id,
+            phase="synthesizing",
+            current_step=len(plan),
+            total_steps=len(plan),
+            plan_json=json.dumps(
+                [
+                    {
+                        "title": item.title,
+                        "objective": item.objective,
+                        "search_queries": item.search_queries,
+                    }
+                    for item in plan
+                ],
+                ensure_ascii=False,
+            ),
+            findings_json=json.dumps(findings, ensure_ascii=False),
+            references_json=json.dumps(references, ensure_ascii=False),
+            started_at="2026-04-22T10:00:00+00:00",
+        )
+
+        current = await service.get(job.id)
+        assert current is not None
+        assert current["status"] == "completed"
+        assert current["phase"] == "completed"
+        report = current["report_markdown"] or ""
+        assert "已自动切换为本地汇总结果" in report
+        assert "## 执行摘要" in report
+        assert "## 参考来源" in report
 
     asyncio.run(run())
 

@@ -12,6 +12,8 @@ from app.services.research_agent import ResearchAgent, ResearchPlanStep, Researc
 from app.services.search_service import SearchService
 from app.services.web_fetch_service import WebFetchService
 
+RESEARCH_RUNTIME_VERSION = "research-fix-2026-04-22-04"
+
 
 class ResearchService:
     def __init__(
@@ -22,15 +24,18 @@ class ResearchService:
         chat_provider: ChatProviderBase | None = None,
         queue_binding: Any | None = None,
         stalled_job_timeout_seconds: float = 8.0,
+        synthesis_stall_timeout_seconds: float = 40.0,
     ) -> None:
         self.repository = repository
         self.agent = ResearchAgent(
             search_service=search_service,
             web_fetch_service=web_fetch_service,
             chat_provider=chat_provider,
+            log_callback=self._log_from_agent,
         )
         self.queue_binding = queue_binding
         self.stalled_job_timeout_seconds = max(0.0, stalled_job_timeout_seconds)
+        self.synthesis_stall_timeout_seconds = max(0.0, synthesis_stall_timeout_seconds)
         self.running_jobs: dict[str, asyncio.Task] = {}
         self.progress_locks: dict[str, asyncio.Lock] = {}
 
@@ -87,8 +92,13 @@ class ResearchService:
         if not job:
             self._log("get.missing", job_id=job_id)
             return None
-        payload = job.to_dict()
         state = await self.repository.get_research_job_state(job_id)
+        if state and state.phase == "synthesizing":
+            recovered = await self._recover_stalled_synthesis(job_id)
+            if recovered:
+                job = await self.repository.get_research_job(job_id) or job
+                state = await self.repository.get_research_job_state(job_id) or state
+        payload = job.to_dict()
         if state:
             payload["phase"] = state.phase
             payload["current_step"] = state.current_step
@@ -171,6 +181,15 @@ class ResearchService:
         if not state:
             self._log("resume.skip_missing_state", job_id=job_id)
             return
+        if state.phase != "queued":
+            self._log(
+                "resume.skip_active_phase",
+                job_id=job_id,
+                phase=state.phase,
+                current_step=state.current_step,
+                total_steps=state.total_steps,
+            )
+            return
         stalled = _is_stalled(state.updated_at, timeout_seconds=self.stalled_job_timeout_seconds)
         self._log(
             "resume.inspect",
@@ -189,6 +208,76 @@ class ResearchService:
         except Exception as exc:
             self._log("resume.error", job_id=job_id, error=str(exc))
             await self.mark_failed(job_id, str(exc))
+
+    async def _recover_stalled_synthesis(self, job_id: str) -> bool:
+        state = await self.repository.get_research_job_state(job_id)
+        job = await self.repository.get_research_job(job_id)
+        if not state or not job:
+            return False
+        stalled = _is_stalled(state.updated_at, timeout_seconds=self.synthesis_stall_timeout_seconds)
+        self._log(
+            "synthesis.inspect",
+            job_id=job_id,
+            status=job.status,
+            phase=state.phase,
+            current_step=state.current_step,
+            total_steps=state.total_steps,
+            updated_at=state.updated_at,
+            stalled=stalled,
+            timeout_seconds=self.synthesis_stall_timeout_seconds,
+        )
+        if state.phase != "synthesizing" or job.status in {"completed", "failed"} or not stalled:
+            return False
+
+        async with self._progress_lock(job_id):
+            latest_state = await self.repository.get_research_job_state(job_id)
+            latest_job = await self.repository.get_research_job(job_id)
+            if not latest_state or not latest_job:
+                return False
+            if latest_state.phase != "synthesizing" or latest_job.status in {"completed", "failed"}:
+                return False
+            if not _is_stalled(latest_state.updated_at, timeout_seconds=self.synthesis_stall_timeout_seconds):
+                return False
+
+            plan = _deserialize_plan(latest_state.plan_json)
+            findings = _deserialize_findings(latest_state.findings_json)
+            references = _deserialize_references(latest_state.references_json)
+            self._log(
+                "synthesis.force_fallback",
+                job_id=job_id,
+                findings_count=len(findings),
+                references_count=len(references),
+            )
+            fallback_report = self.agent.render_fallback_report(
+                query=latest_job.query,
+                plan=plan,
+                findings=findings,
+                references=references,
+            )
+            fallback_report = (
+                "# 研究报告\n\n"
+                "> 检测到最终汇总阶段长时间未完成，已自动切换为本地汇总结果。\n\n"
+                + fallback_report.removeprefix("# 研究报告\n\n")
+            )
+            completed_at = utc_now_iso()
+            await self.repository.update_research_job_state(
+                job_id,
+                phase="completed",
+                current_step=latest_state.total_steps or len(plan),
+                total_steps=latest_state.total_steps or len(plan),
+                findings_json=_serialize_findings(findings),
+                references_json=json.dumps(references, ensure_ascii=False),
+                started_at=latest_state.started_at,
+                completed_at=completed_at,
+                last_error="Final synthesis stalled; completed with local fallback report.",
+            )
+            await self.repository.update_research_job(
+                job_id,
+                status="completed",
+                report_markdown=fallback_report,
+            )
+            self._log("job.completed_fallback", job_id=job_id, completed_at=completed_at)
+            return True
 
     async def _process_one_transition(self, job_id: str) -> bool:
         async with self._progress_lock(job_id):
@@ -344,11 +433,19 @@ class ResearchService:
         return True
 
     def _log(self, event: str, **fields: Any) -> None:
-        payload = {"scope": "research", "event": event, **fields}
+        payload = {
+            "scope": "research",
+            "event": event,
+            "runtime_version": RESEARCH_RUNTIME_VERSION,
+            **fields,
+        }
         try:
             print(f"[taskmate] {json.dumps(payload, ensure_ascii=False, default=str)}")
         except Exception:  # noqa: BLE001
             print(f"[taskmate] research event={event} fields={fields!r}")
+
+    def _log_from_agent(self, event: str, fields: dict[str, Any]) -> None:
+        self._log(event, **fields)
 
 
 def _serialize_plan(plan: list[ResearchPlanStep]) -> str:

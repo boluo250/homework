@@ -20,11 +20,16 @@ const state = {
 
 const dom = {
   chatForm: document.getElementById("chatForm"),
+  submitButton: document.querySelector("#chatForm .primary-button"),
   messageInput: document.getElementById("messageInput"),
   messageList: document.getElementById("messageList"),
   taskList: document.getElementById("taskList"),
   fileList: document.getElementById("fileList"),
+  researchDock: document.getElementById("researchDock"),
   reportBox: document.getElementById("reportBox"),
+  researchProgressTitle: document.getElementById("researchProgressTitle"),
+  researchProgressMeta: document.getElementById("researchProgressMeta"),
+  researchProgressFill: document.getElementById("researchProgressFill"),
   refreshTasksButton: document.getElementById("refreshTasksButton"),
   newConversationButton: document.getElementById("newConversationButton"),
   resetDataButton: document.getElementById("resetDataButton"),
@@ -42,6 +47,7 @@ const dom = {
 
 dom.clientIdTag.textContent = `client_id: ${state.clientId}`;
 applyAssistantIdentity(state.assistantName);
+renderResearchState({ status: "idle", report_markdown: "等待研究模式返回结果..." });
 initializeWorkspace();
 
 dom.chatForm.addEventListener("submit", async (event) => {
@@ -71,6 +77,11 @@ async function submitChat() {
 
   appendMessage("user", message);
   dom.messageInput.value = "";
+  const pendingMessageId = appendMessage("assistant", "", {
+    thinking: true,
+    thinkingLabel: pendingChatLabel(message),
+  });
+  setComposerBusy(true);
 
   try {
     const response = await fetch("/api/chat", {
@@ -93,7 +104,7 @@ async function submitChat() {
     if (payload.assistant_name) {
       applyAssistantIdentity(payload.assistant_name);
     }
-    appendMessage("assistant", payload.reply);
+    updateMessage(pendingMessageId, payload.reply);
 
     await refreshTasks(payload.user_profile?.id);
     await refreshFiles();
@@ -102,7 +113,9 @@ async function submitChat() {
       await submitResearchJob(message);
     }
   } catch (error) {
-    appendMessage("assistant", `请求失败：${error.message}`);
+    updateMessage(pendingMessageId, `请求失败：${error.message}`);
+  } finally {
+    setComposerBusy(false);
   }
 }
 
@@ -157,8 +170,7 @@ dom.resetDataButton.addEventListener("click", async () => {
     localStorage.removeItem(storageKeys.conversationId);
     dom.messageList.innerHTML = "";
     appendMessage("assistant", "数据已经清空。现在可以重新上传文件并从干净状态开始测试。");
-    dom.reportBox.textContent = "等待研究模式返回结果..."
-    setResearchStatus("idle");
+    renderResearchState({ status: "idle", report_markdown: "等待研究模式返回结果..." });
     dom.uploadStatus.textContent = `已清空数据，R2 删除 ${payload.deleted_r2_count} 个文件。`;
     await refreshTasks();
     await refreshFiles();
@@ -354,8 +366,13 @@ async function deleteFile(fileId) {
 async function submitResearchJob(query) {
   const messageId = `research_${crypto.randomUUID().slice(0, 8)}`;
   state.researchMessageId = messageId;
-  setResearchStatus("pending");
-  dom.reportBox.textContent = "研究任务已提交，正在建立检索计划...";
+  renderResearchState({
+    status: "pending",
+    phase: "pending",
+    current_step: 0,
+    total_steps: 0,
+    report_markdown: "研究任务已提交，正在建立检索计划...",
+  });
   appendMessage("assistant", "", {
     messageId,
     thinking: true,
@@ -371,12 +388,16 @@ async function submitResearchJob(query) {
   });
   const payload = await response.json();
   if (!response.ok) {
-    setResearchStatus("failed");
-    dom.reportBox.textContent = payload.error || "研究任务提交失败";
+    renderResearchState({
+      status: "failed",
+      phase: "failed",
+      report_markdown: payload.error || "研究任务提交失败",
+    });
     updateMessage(messageId, payload.error || "研究任务提交失败，请稍后重试。");
     return;
   }
   state.researchJobId = payload.id;
+  renderResearchState(payload);
   await pollResearchJob(payload.id, messageId);
 }
 
@@ -386,26 +407,26 @@ async function pollResearchJob(jobId, messageId) {
     const response = await fetch(`/api/research?job_id=${encodeURIComponent(jobId)}`);
     const payload = await response.json();
     const phase = payload.phase || payload.state?.phase || payload.status;
-    setResearchStatus(phase);
-    if (payload.report_markdown) {
-      dom.reportBox.textContent = payload.report_markdown;
-    }
+    renderResearchState(payload);
     updateMessage(messageId, "", {
       thinking: payload.status !== "completed" && payload.status !== "failed",
       thinkingLabel: researchThinkingLabel(phase),
     });
     if (payload.status === "completed" || payload.status === "failed") {
       if (payload.status === "completed") {
-        updateMessage(messageId, "研究完成了。我已经把完整报告写到下方研究结果区，你可以继续追问其中任意一个子结论。");
+        updateMessage(messageId, "研究完成了。我已经把完整报告写进当前对话面板里的研究卡片，你可以继续追问其中任意一个子结论。");
       } else {
-        updateMessage(messageId, "这次研究执行失败了。错误信息我已经同步到下方研究结果区。");
+        updateMessage(messageId, "这次研究执行失败了。错误信息我已经同步到当前对话面板里的研究卡片。");
       }
       state.researchJobId = "";
       return;
     }
   }
-  setResearchStatus("timeout");
-  dom.reportBox.textContent = "自动轮询已持续 5 分钟，前端先停止等待。研究如果仍在后台执行，你可以稍后继续查看结果。";
+  renderResearchState({
+    status: "timeout",
+    phase: "timeout",
+    report_markdown: "自动轮询已持续 5 分钟，前端先停止等待。研究如果仍在后台执行，你可以稍后继续查看结果。",
+  });
   updateMessage(messageId, "我已经持续轮询了 5 分钟。前端先停止自动等待，但如果后台还在跑，稍后再进入页面或继续发消息时仍可以继续查看结果。");
 }
 
@@ -502,8 +523,92 @@ function applyAssistantIdentity(name) {
   }
 }
 
+function setComposerBusy(isBusy) {
+  if (dom.submitButton) {
+    dom.submitButton.disabled = isBusy;
+    dom.submitButton.textContent = isBusy ? "处理中..." : "发送";
+  }
+  dom.messageInput.disabled = isBusy;
+}
+
+function pendingChatLabel(message) {
+  const lowered = message.toLowerCase();
+  if (state.selectedFileIds.size > 0 || /文档|文件|pdf|docx|总结|概括|归纳/.test(message)) {
+    return "正在整理文件内容";
+  }
+  if (/研究|调研|对比|方案|报告|分析/.test(message)) {
+    return "正在准备研究计划";
+  }
+  if (/任务|待办|todo|提醒/.test(lowered) || /任务|待办|提醒/.test(message)) {
+    return "正在处理任务请求";
+  }
+  return "正在思考";
+}
+
 function setResearchStatus(status) {
   dom.researchStatusTag.textContent = researchStatusLabel(status);
+  if (dom.researchDock) {
+    dom.researchDock.dataset.state = status || "idle";
+  }
+}
+
+function renderResearchState(payload = {}) {
+  const phase = payload.phase || payload.state?.phase || payload.status || "idle";
+  const status = payload.status || phase || "idle";
+  const currentStep = Number(payload.current_step ?? payload.state?.current_step ?? 0);
+  const totalSteps = Number(payload.total_steps ?? payload.state?.total_steps ?? 0);
+  const percent = researchProgressPercent({ status, phase, currentStep, totalSteps });
+  const title = researchProgressTitle({ status, phase, currentStep, totalSteps });
+  const meta = researchProgressMeta({ status, phase, currentStep, totalSteps, percent });
+  const reportText = payload.report_markdown || (status === "idle" ? "等待研究模式返回结果..." : dom.reportBox.textContent);
+
+  setResearchStatus(phase);
+  dom.researchProgressTitle.textContent = title;
+  dom.researchProgressMeta.textContent = meta;
+  dom.researchProgressFill.style.width = `${percent}%`;
+  dom.reportBox.textContent = reportText;
+}
+
+function researchProgressPercent({ status, phase, currentStep, totalSteps }) {
+  if (status === "completed") return 100;
+  if (status === "failed") {
+    return totalSteps > 0 ? Math.max(12, Math.round((currentStep / totalSteps) * 100)) : 100;
+  }
+  if (status === "timeout") return 100;
+  if (status === "pending") return 6;
+  if (phase === "synthesizing") {
+    return totalSteps > 0 ? Math.min(98, Math.round(((Math.max(currentStep, totalSteps - 0.25)) / totalSteps) * 100)) : 88;
+  }
+  if (phase === "searching") {
+    return totalSteps > 0 ? Math.min(94, Math.round(((currentStep + 0.55) / totalSteps) * 100)) : 28;
+  }
+  if (phase === "queued") {
+    return totalSteps > 0 ? Math.max(8, Math.round((currentStep / totalSteps) * 100)) : 8;
+  }
+  return 0;
+}
+
+function researchProgressTitle({ status, phase, currentStep, totalSteps }) {
+  if (status === "completed") return "研究完成，报告已生成";
+  if (status === "failed") return "研究执行失败";
+  if (status === "timeout") return "前端已停止自动轮询";
+  if (status === "pending") return "研究任务已提交，正在建立计划";
+  if (phase === "synthesizing") return "正在汇总最终报告";
+  if (phase === "searching" && totalSteps > 0) {
+    return `正在执行第 ${Math.min(currentStep + 1, totalSteps)} / ${totalSteps} 步`;
+  }
+  if (phase === "queued" && totalSteps > 0) {
+    return `已完成 ${currentStep} / ${totalSteps} 步，准备进入下一阶段`;
+  }
+  return "等待新的研究任务";
+}
+
+function researchProgressMeta({ status, phase, currentStep, totalSteps, percent }) {
+  if (status === "idle") return "尚未开始";
+  if (totalSteps > 0) {
+    return `${researchStatusLabel(phase)} · ${currentStep}/${totalSteps} · ${percent}%`;
+  }
+  return `${researchStatusLabel(phase)} · ${percent}%`;
 }
 
 function researchStatusLabel(status) {

@@ -8,10 +8,13 @@ from typing import Any
 
 
 try:  # pragma: no cover
-    from js import fetch  # type: ignore
+    from js import AbortController, clearTimeout, fetch, setTimeout  # type: ignore
     from pyodide.ffi import to_js as _to_js  # type: ignore
 except ImportError:  # pragma: no cover
+    AbortController = None
+    clearTimeout = None
     fetch = None
+    setTimeout = None
     _to_js = None
 
 
@@ -54,11 +57,26 @@ class HttpClient:
         payload: bytes | None,
     ) -> HttpResponseData:
         options: dict[str, Any] = {"method": method, "headers": _to_js(headers)}
+        timeout_id = None
+        controller = None
+        if AbortController is not None and setTimeout is not None:
+            controller = AbortController.new()
+            options["signal"] = controller.signal
+            timeout_id = setTimeout(controller.abort, int(self.timeout_seconds * 1000))
         if payload is not None:
             options["body"] = payload.decode("utf-8")
-        response = await fetch(url, _to_js(options))
-        body_text = await response.text()
-        return HttpResponseData(status=int(response.status), body_text=str(body_text))
+        try:
+            response = await fetch(url, _to_js(options))
+            body_text = await response.text()
+            return HttpResponseData(status=int(response.status), body_text=str(body_text))
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if "AbortError" in message or "aborted" in message.lower():
+                raise RuntimeError(f"HTTP request timed out after {self.timeout_seconds:.1f}s") from exc
+            raise RuntimeError(f"HTTP request failed: {message}") from exc
+        finally:
+            if timeout_id is not None and clearTimeout is not None:
+                clearTimeout(timeout_id)
 
     def _request_via_urllib(
         self,

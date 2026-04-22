@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 from app.providers.llm_base import ChatProviderBase
@@ -11,6 +12,7 @@ from app.services.web_fetch_service import WebFetchService
 
 
 ProgressCallback = Callable[[str, str], Awaitable[None]]
+ResearchLogCallback = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass(slots=True)
@@ -28,15 +30,19 @@ class ResearchStepResult:
 
 
 class ResearchAgent:
+    SYNTHESIS_TIMEOUT_SECONDS = 25.0
+
     def __init__(
         self,
         search_service: SearchService,
         web_fetch_service: WebFetchService,
         chat_provider: ChatProviderBase | None = None,
+        log_callback: ResearchLogCallback | None = None,
     ) -> None:
         self.search_service = search_service
         self.web_fetch_service = web_fetch_service
         self.chat_provider = chat_provider
+        self.log_callback = log_callback
 
     async def execute(self, *, query: str, on_progress: ProgressCallback) -> str:
         plan = self.build_plan(query)
@@ -107,6 +113,16 @@ class ResearchAgent:
         references: list[dict],
     ) -> str:
         return await self._synthesize_report(query=query, plan=plan, findings=findings, references=references)
+
+    def render_fallback_report(
+        self,
+        *,
+        query: str,
+        plan: list[ResearchPlanStep],
+        findings: list[ResearchStepResult],
+        references: list[dict],
+    ) -> str:
+        return _render_fallback_report(query=query, plan=plan, findings=findings, references=references)
 
     def build_plan(self, query: str) -> list[ResearchPlanStep]:
         lowered = query.lower()
@@ -283,7 +299,19 @@ class ResearchAgent:
         references: list[dict],
     ) -> str | None:
         if self.chat_provider is None:
+            self._log("llm.skip_missing_provider")
             return None
+
+        provider_name = self.chat_provider.__class__.__name__
+        provider_model = str(getattr(self.chat_provider, "model", "") or "")
+        self._log(
+            "llm.start",
+            provider=provider_name,
+            model=provider_model,
+            api_key_configured=bool(getattr(self.chat_provider, "api_key", None)),
+            findings_count=len(findings),
+            references_count=len(references),
+        )
 
         compact_findings = []
         for item in findings:
@@ -314,10 +342,63 @@ class ResearchAgent:
                 ),
             ]
         )
-        reply = await self.chat_provider.chat(system_prompt=prompt, user_message=user_message)
-        if not reply.strip() or _looks_like_provider_failure(reply):
+        try:
+            reply = await asyncio.wait_for(
+                self.chat_provider.chat(system_prompt=prompt, user_message=user_message),
+                timeout=self.SYNTHESIS_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self._log(
+                "llm.timeout",
+                provider=provider_name,
+                model=provider_model,
+                timeout_seconds=self.SYNTHESIS_TIMEOUT_SECONDS,
+            )
             return None
-        return reply.strip()
+        except TimeoutError:
+            self._log(
+                "llm.timeout",
+                provider=provider_name,
+                model=provider_model,
+                timeout_seconds=self.SYNTHESIS_TIMEOUT_SECONDS,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                "llm.error",
+                provider=provider_name,
+                model=provider_model,
+                error=str(exc)[:1000],
+            )
+            return None
+
+        normalized_reply = reply.strip()
+        if not normalized_reply:
+            self._log("llm.empty", provider=provider_name, model=provider_model)
+            return None
+        if _looks_like_provider_failure(normalized_reply):
+            self._log(
+                "llm.provider_failure",
+                provider=provider_name,
+                model=provider_model,
+                preview=normalized_reply[:300],
+            )
+            return None
+        self._log(
+            "llm.done",
+            provider=provider_name,
+            model=provider_model,
+            reply_length=len(normalized_reply),
+        )
+        return normalized_reply
+
+    def _log(self, event: str, **fields: Any) -> None:
+        if self.log_callback is None:
+            return
+        try:
+            self.log_callback(event, fields)
+        except Exception:  # noqa: BLE001
+            return
 
 
 def _extract_domain(url: str) -> str:
