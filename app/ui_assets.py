@@ -46,10 +46,17 @@ INDEX_HTML = """<!doctype html>
           </div>
           <p class="section-note">上传资料后，可以把选中的文件作为聊天上下文直接参与问答。</p>
           <form id="uploadForm" class="upload-form">
-            <input id="fileInput" type="file" accept=".txt,.md,.pdf,.docx,.png,.jpg,.jpeg" />
+            <input
+              id="fileInput"
+              type="file"
+              accept=".txt,.md,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,.mp3,.wav,.m4a,.ogg,.flac,.aac,.aiff,.aif,.mp4,.mov,.webm,.mpeg,.mpg,.m4v"
+            />
             <button type="submit" class="ghost-button">上传文件</button>
           </form>
-          <p id="uploadStatus" class="muted">支持 txt、md、pdf、docx、png、jpg、jpeg，单文件最大 10MB。</p>
+          <p id="uploadStatus" class="muted">
+            支持 txt、md、pdf、docx、图片（含 webp/gif）、音频（mp3/wav 等）、视频（mp4/mov/webm 等），单文件最大 10MB；音视频与图片默认可通过
+            OpenRouter MiMo Omni 抽取文本后入库。
+          </p>
           <div id="fileList" class="stack empty-state">还没有文件</div>
         </section>
       </aside>

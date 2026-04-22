@@ -7,7 +7,31 @@ from pathlib import Path
 
 
 class FileParser:
-    SUPPORTED_TYPES = {".txt", ".md", ".pdf", ".docx", ".png", ".jpg", ".jpeg"}
+    SUPPORTED_TYPES = {
+        ".txt",
+        ".md",
+        ".pdf",
+        ".docx",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".mp3",
+        ".wav",
+        ".m4a",
+        ".ogg",
+        ".flac",
+        ".aac",
+        ".aiff",
+        ".aif",
+        ".mp4",
+        ".mov",
+        ".webm",
+        ".mpeg",
+        ".mpg",
+        ".m4v",
+    }
     SHORT_DOC_MAX_CHARS = 3000
     MEDIUM_DOC_MAX_CHARS = 12000
     STRUCTURED_DOC_KEYWORDS = {

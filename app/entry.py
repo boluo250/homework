@@ -28,10 +28,12 @@ from app.services.embedding_service import EmbeddingService
 from app.services.cloudflare_d1_repo import CloudflareD1Repository
 from app.services.cloudflare_r2_store import CloudflareR2FileStore
 from app.services.d1_repo import SQLiteAppRepository
+from app.services.document_parse_router import CompositeDocumentParseService
 from app.services.file_parser import FileParser
 from app.services.file_service import FileService
 from app.services.memory_service import MemoryService
 from app.services.mistral_document_parse import MistralDocumentParseService
+from app.services.openrouter_omni_media_parse import OpenRouterOmniMediaParseService
 from app.services.openrouter_client import OpenRouterClient
 from app.services.qdrant_store import QdrantStore
 from app.services.r2_store import R2FileStore
@@ -134,9 +136,16 @@ class AppContainer:
             file_parser=FileParser(),
             embedding_provider=embedding_provider,
             qdrant_store=qdrant_store,
-            pdf_parse_service=MistralDocumentParseService(
-                api_key=getattr(env, "MISTRAL_API_KEY", None),
-                model=getattr(env, "MISTRAL_OCR_MODEL", "mistral-ocr-latest"),
+            pdf_parse_service=CompositeDocumentParseService(
+                mistral=MistralDocumentParseService(
+                    api_key=getattr(env, "MISTRAL_API_KEY", None),
+                    model=getattr(env, "MISTRAL_OCR_MODEL", "mistral-ocr-latest"),
+                ),
+                omni=OpenRouterOmniMediaParseService(
+                    api_key=getattr(env, "OPENROUTER_API_KEY", None),
+                    model=getattr(env, "OPENROUTER_OMNI_MODEL", "xiaomi/mimo-v2-omni"),
+                    app_name=getattr(env, "APP_NAME", "TaskMate"),
+                ),
             ),
         )
         self.research_service = ResearchService(

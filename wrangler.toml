@@ -9,6 +9,8 @@ R2_BUCKET_NAME = "taskmate-homework-files"
 QDRANT_URL = "https://c2746150-b424-42d5-be28-18f2c49db54d.us-east4-0.gcp.cloud.qdrant.io"
 MISTRAL_OCR_MODEL = "mistral-ocr-latest"
 OPENROUTER_MODEL = "moonshotai/kimi-k2.6"
+# Multimodal extract for uploads (image/audio/video); can differ from OPENROUTER_MODEL (chat).
+OPENROUTER_OMNI_MODEL = "xiaomi/mimo-v2-omni"
 
 [observability.logs]
 enabled = true

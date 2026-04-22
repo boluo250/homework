@@ -38,6 +38,20 @@ class MistralDocumentParseService:
         response = await self._ocr_request(payload)
         return self._extract_text_from_response(filename=filename, response_status=response.status, body_text=response.body_text)
 
+    async def parse_audio(self, *, filename: str, content: bytes) -> str:
+        _ = content
+        raise ValueError(
+            f"Mistral OCR does not support audio ({filename}). "
+            "Configure OPENROUTER_API_KEY with MiMo Omni via CompositeDocumentParseService."
+        )
+
+    async def parse_video(self, *, filename: str, content: bytes) -> str:
+        _ = content
+        raise ValueError(
+            f"Mistral OCR does not support video ({filename}). "
+            "Configure OPENROUTER_API_KEY with MiMo Omni via CompositeDocumentParseService."
+        )
+
     def _build_payload(self, *, mime_type: str, base64_body: str) -> dict:
         return {
             "model": self.model,

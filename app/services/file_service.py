@@ -12,10 +12,16 @@ from app.services.file_parser import FileParser
 from app.services.qdrant_store import QdrantStore
 from app.services.r2_store import R2FileStore
 
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac", ".aiff", ".aif"}
+_VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mpeg", ".mpg", ".m4v"}
+
 
 class PdfParseService(Protocol):
     async def parse_pdf(self, *, filename: str, content: bytes) -> str: ...
     async def parse_image(self, *, filename: str, content: bytes) -> str: ...
+    async def parse_audio(self, *, filename: str, content: bytes) -> str: ...
+    async def parse_video(self, *, filename: str, content: bytes) -> str: ...
 
 
 class FileService:
@@ -63,10 +69,18 @@ class FileService:
                 if self.pdf_parse_service is None:
                     raise ValueError("PDF parsing service is not configured.")
                 text = await self.pdf_parse_service.parse_pdf(filename=filename, content=content)
-            elif suffix in {".png", ".jpg", ".jpeg"}:
+            elif suffix in _IMAGE_SUFFIXES:
                 if self.pdf_parse_service is None:
-                    raise ValueError("Image OCR service is not configured.")
+                    raise ValueError("Image extraction service is not configured.")
                 text = await self.pdf_parse_service.parse_image(filename=filename, content=content)
+            elif suffix in _AUDIO_SUFFIXES:
+                if self.pdf_parse_service is None:
+                    raise ValueError("Audio extraction service is not configured.")
+                text = await self.pdf_parse_service.parse_audio(filename=filename, content=content)
+            elif suffix in _VIDEO_SUFFIXES:
+                if self.pdf_parse_service is None:
+                    raise ValueError("Video extraction service is not configured.")
+                text = await self.pdf_parse_service.parse_video(filename=filename, content=content)
             else:
                 text = self.file_parser.parse_text(filename, content)
         except Exception as exc:  # noqa: BLE001
