@@ -125,6 +125,15 @@ def test_demo_e2e_chat_task_and_search_flow(tmp_path: Path) -> None:
         assert "面试作业" in listed["reply"]
         assert "Cloudflare Worker" in listed["reply"]
 
+        task_detail = await chat(
+            container,
+            client_id,
+            '看看"面试作业"任务的具体需求',
+            conversation_id=profile["conversation_id"],
+        )
+        assert "任务详情" in task_detail["reply"]
+        assert "Cloudflare Worker 项目经验" in task_detail["reply"]
+
         search_result = await chat(
             container,
             client_id,
@@ -173,6 +182,15 @@ def test_demo_e2e_file_workspace_and_rag_flow(tmp_path: Path) -> None:
         assert file_list["files"][0]["filename"] == "resume.md"
         assert file_list["files"][0]["vector_count"] >= 1
 
+        file_detail = await request_json(
+            container,
+            "GET",
+            f"/api/files?client_id={client_id}&file_id={file_id}",
+        )
+        assert file_detail["file"]["filename"] == "resume.md"
+        assert file_detail["vector_count"] >= 1
+        assert "Cloudflare Worker" in file_detail["preview_text"]
+
         renamed = await request_json(
             container,
             "PATCH",
@@ -184,6 +202,14 @@ def test_demo_e2e_file_workspace_and_rag_flow(tmp_path: Path) -> None:
             },
         )
         assert renamed["file"]["filename"] == "resume-final.md"
+
+        renamed_detail = await request_json(
+            container,
+            "GET",
+            f"/api/files?client_id={client_id}&file_id={file_id}",
+        )
+        assert renamed_detail["file"]["filename"] == "resume-final.md"
+        assert "Agent 平台设计" in renamed_detail["preview_text"]
 
         answer = await chat(
             container,

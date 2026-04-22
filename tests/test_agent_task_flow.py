@@ -54,9 +54,18 @@ def test_agent_task_flow_create_then_list(tmp_path) -> None:
                 conversation_id=completed_profile.conversation_id,
             )
         )
+        detailed_after_profile = await agent.handle_chat(
+            ChatRequest(
+                client_id="client_test",
+                message='看看"项目复盘"任务的具体需求',
+                conversation_id=completed_profile.conversation_id,
+            )
+        )
         assert "已创建任务" in created_after_profile.reply
         assert "需求" in created_after_profile.reply
         assert "项目复盘" in listed_after_profile.reply
         assert "行动项" in listed_after_profile.reply
+        assert "任务详情" in detailed_after_profile.reply
+        assert "行动项" in detailed_after_profile.reply
 
     asyncio.run(run())

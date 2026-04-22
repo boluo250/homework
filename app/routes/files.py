@@ -7,11 +7,17 @@ async def handle_files(request: HttpRequest, repository, file_service) -> HttpRe
     if request.method == "GET":
         client_id = request.query.get("client_id")
         user_id = request.query.get("user_id")
+        file_id = request.query.get("file_id")
         if not user_id and client_id:
             user = await repository.get_or_create_user(client_id)
             user_id = user.id
         if not user_id:
             return HttpResponse.json({"error": "user_id or client_id is required"}, status=400)
+        if file_id:
+            detail = await file_service.get_file_detail_for_user(user_id=user_id, file_id=file_id)
+            if not detail:
+                return HttpResponse.json({"error": "file not found"}, status=404)
+            return HttpResponse.json(detail)
         files = await repository.list_files(user_id)
         payload_files = []
         for file in files:

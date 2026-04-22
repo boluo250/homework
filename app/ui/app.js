@@ -13,6 +13,7 @@ const state = {
   conversationId: localStorage.getItem(storageKeys.conversationId) || "",
   assistantName: localStorage.getItem(storageKeys.assistantName) || "TaskMate",
   selectedFileIds: new Set(),
+  activeFileId: "",
   researchJobId: "",
   researchMessageId: "",
   isComposing: false,
@@ -39,6 +40,7 @@ const dom = {
   uploadForm: document.getElementById("uploadForm"),
   fileInput: document.getElementById("fileInput"),
   uploadStatus: document.getElementById("uploadStatus"),
+  fileDetailCard: document.getElementById("fileDetailCard"),
   researchStatusTag: document.getElementById("researchStatusTag"),
   selectedFilesHint: document.getElementById("selectedFilesHint"),
   copyReportButton: document.getElementById("copyReportButton"),
@@ -210,6 +212,7 @@ dom.uploadForm.addEventListener("submit", async (event) => {
     dom.uploadStatus.textContent = `解析与向量化完成：${payload.file.filename}，共切分 ${payload.chunk_count} 个片段，Qdrant 已写入 ${payload.vector_count} 条向量。`;
     dom.fileInput.value = "";
     await refreshFiles(payload.user_id);
+    await loadFileDetails(payload.file.id, payload.user_id);
   } catch (error) {
     dom.uploadStatus.textContent = `上传失败：${error.message}`;
   }
@@ -262,6 +265,8 @@ async function refreshFiles(userId = "") {
   if (!payload.files || payload.files.length === 0) {
     dom.fileList.className = "stack empty-state";
     dom.fileList.textContent = "还没有文件";
+    state.activeFileId = "";
+    renderFileDetails();
     renderSelectedFilesHint();
     return;
   }
@@ -287,6 +292,7 @@ async function refreshFiles(userId = "") {
         </div>
       </label>
       <div class="file-actions">
+        <button class="ghost-button" type="button" data-view-file-id="${escapeHtml(file.id)}">查看详情</button>
         <button class="ghost-button" type="button" data-rename-file-id="${escapeHtml(file.id)}">重命名</button>
         <button class="inline-danger" type="button" data-delete-file-id="${escapeHtml(file.id)}">删除文件</button>
       </div>
@@ -313,6 +319,13 @@ async function refreshFiles(userId = "") {
     });
   });
 
+  dom.fileList.querySelectorAll("[data-view-file-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const fileId = button.dataset.viewFileId;
+      await loadFileDetails(fileId);
+    });
+  });
+
   dom.fileList.querySelectorAll("[data-rename-file-id]").forEach((button) => {
     button.addEventListener("click", async () => {
       const fileId = button.dataset.renameFileId;
@@ -326,6 +339,17 @@ async function refreshFiles(userId = "") {
   });
 
   renderSelectedFilesHint();
+  if (state.activeFileId && validIds.has(state.activeFileId)) {
+    await loadFileDetails(state.activeFileId, payload.user_id || resolvedUserId, { silent: true });
+  } else {
+    const [firstFile] = payload.files;
+    state.activeFileId = firstFile?.id || "";
+    if (state.activeFileId) {
+      await loadFileDetails(state.activeFileId, payload.user_id || resolvedUserId, { silent: true });
+    } else {
+      renderFileDetails();
+    }
+  }
 }
 
 async function renameFile(fileId, filename) {
@@ -346,6 +370,7 @@ async function renameFile(fileId, filename) {
   }
   dom.uploadStatus.textContent = `已重命名文件：${payload.file.filename}`;
   await refreshFiles();
+  await loadFileDetails(fileId);
 }
 
 async function deleteFile(fileId) {
@@ -359,8 +384,67 @@ async function deleteFile(fileId) {
     return;
   }
   state.selectedFileIds.delete(fileId);
+  if (state.activeFileId === fileId) {
+    state.activeFileId = "";
+  }
   dom.uploadStatus.textContent = `已删除文件：${payload.deleted.filename}`;
   await refreshFiles();
+}
+
+async function loadFileDetails(fileId, userId = "", options = {}) {
+  if (!fileId) {
+    state.activeFileId = "";
+    renderFileDetails();
+    return;
+  }
+  state.activeFileId = fileId;
+  if (!options.silent) {
+    renderFileDetails({ loading: true });
+  }
+
+  const resolvedUserId = userId || window.__taskmateLastUserId || "";
+  const query = resolvedUserId
+    ? `user_id=${encodeURIComponent(resolvedUserId)}&file_id=${encodeURIComponent(fileId)}`
+    : `client_id=${encodeURIComponent(state.clientId)}&file_id=${encodeURIComponent(fileId)}`;
+  const response = await fetch(`/api/files?${query}`);
+  const payload = await response.json();
+  if (!response.ok) {
+    renderFileDetails({ error: payload.error || "加载文件详情失败" });
+    return;
+  }
+  renderFileDetails(payload);
+}
+
+function renderFileDetails(payload = {}) {
+  if (payload.loading) {
+    dom.fileDetailCard.className = "file-detail-card";
+    dom.fileDetailCard.innerHTML = "<p class=\"muted\">正在加载文件详情...</p>";
+    return;
+  }
+  if (payload.error) {
+    dom.fileDetailCard.className = "file-detail-card";
+    dom.fileDetailCard.innerHTML = `<p class="muted">文件详情加载失败：${escapeHtml(payload.error)}</p>`;
+    return;
+  }
+  if (!payload.file) {
+    dom.fileDetailCard.className = "file-detail-card empty-state";
+    dom.fileDetailCard.textContent = "选择一个文件后，这里会展示文件详情和内容预览。";
+    return;
+  }
+
+  const file = payload.file;
+  const previewText = payload.preview_text || file.summary || "当前没有可展示的文本预览。";
+  dom.fileDetailCard.className = "file-detail-card";
+  dom.fileDetailCard.innerHTML = `
+    <h3>${escapeHtml(file.filename)}</h3>
+    <div class="file-detail-meta muted">
+      <span>类型：${escapeHtml(file.content_type || "unknown")}</span>
+      <span>大小：${formatFileSize(file.size_bytes || 0)}</span>
+      <span>向量数：${payload.vector_count ?? 0}</span>
+      <span>创建时间：${formatDate(file.created_at)}</span>
+    </div>
+    <pre class="file-preview">${escapeHtml(previewText)}</pre>
+  `;
 }
 
 async function submitResearchJob(query) {
@@ -677,6 +761,13 @@ function guessContentType(filename) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatFileSize(sizeBytes) {
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) return "0 B";
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  if (sizeBytes < 1024 * 1024) return `${(sizeBytes / 1024).toFixed(1)} KB`;
+  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function formatDate(value) {

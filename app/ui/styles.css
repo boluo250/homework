@@ -662,6 +662,38 @@ input[type="file"]::file-selector-button {
   min-width: 112px;
 }
 
+.file-detail-card {
+  margin-top: 14px;
+  padding: 16px;
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.58);
+  border: 1px solid rgba(24, 33, 38, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+}
+
+.file-detail-card h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.file-detail-meta {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.file-preview {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  line-height: 1.6;
+  padding: 12px;
+  border-radius: 16px;
+  background: rgba(17, 24, 28, 0.92);
+  color: #edf2ef;
+}
+
 .upload-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

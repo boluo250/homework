@@ -347,6 +347,44 @@ class AssistantAgent:
                 f"已删除任务：{call.title or '目标任务'}。",
                 [ToolResult(name=call.action.value, ok=True, content=call.to_dict())],
             )
+        if call.action == TaskToolAction.GET:
+            task = None
+            if call.task_id:
+                task = await self.repository.get_task(user_id, call.task_id)
+            elif call.title:
+                task = await self.repository.find_task_by_title(user_id, call.title)
+            else:
+                tasks = await self.repository.list_tasks(user_id)
+                if len(tasks) == 1:
+                    task = tasks[0]
+                elif not tasks:
+                    return (
+                        "你现在还没有任务，我可以直接帮你创建一个。",
+                        [ToolResult(name=call.action.value, ok=True, content=[])],
+                    )
+                else:
+                    return (
+                        "我找到多个任务了。你可以说“看看‘任务名’的详情”，我就能把具体需求展开给你。",
+                        [ToolResult(name=call.action.value, ok=False, content={"task_count": len(tasks)})],
+                    )
+
+            if not task:
+                return (
+                    "我没找到这个任务。你可以把任务名放进引号里再试一次。",
+                    [ToolResult(name=call.action.value, ok=False, content=call.to_dict())],
+                )
+            details = task.details or "暂无具体需求"
+            reply = (
+                f"任务详情：{task.title}\n"
+                f"- 状态：{task.status.value}\n"
+                f"- 优先级：{task.priority.value}\n"
+                f"- 截止时间：{task.due_at or '未设置'}\n"
+                f"- 具体需求：{details}"
+            )
+            return (
+                reply,
+                [ToolResult(name=call.action.value, ok=True, content=task.to_dict())],
+            )
         tasks = await self.repository.list_tasks(user_id)
         if not tasks:
             return (

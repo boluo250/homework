@@ -16,3 +16,9 @@ def test_create_task_protocol_extracts_details() -> None:
     assert call.title == "简历优化"
     assert call.details is not None
     assert "Cloudflare Worker" in call.details
+
+
+def test_get_task_protocol_extracts_title_for_detail_query() -> None:
+    call = parse_task_tool_call('看看"简历优化"任务的具体需求')
+    assert call.action == TaskToolAction.GET
+    assert call.title == "简历优化"

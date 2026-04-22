@@ -141,9 +141,51 @@ class FileService:
             await self.qdrant_store.update_file_metadata(user_id=user.id, file_id=file_id, updates={"filename": next_name})
         return record.to_dict() if record else None
 
+    async def get_file_detail(self, *, client_id: str, file_id: str) -> dict | None:
+        user = await self.repository.get_or_create_user(client_id)
+        return await self.get_file_detail_for_user(user_id=user.id, file_id=file_id)
+
+    async def get_file_detail_for_user(self, *, user_id: str, file_id: str) -> dict | None:
+        record = await self.repository.get_file(user_id, file_id)
+        if not record:
+            return None
+
+        vector_count = await self.qdrant_store.count_by_file(user_id=user_id, file_id=file_id)
+        chunks = await self.qdrant_store.list_chunks_by_file(user_id=user_id, file_id=file_id, limit=6)
+        preview_text = self._build_preview_text(chunks=chunks, summary=record.summary)
+
+        return {
+            "file": record.to_dict(),
+            "vector_count": vector_count,
+            "preview_text": preview_text,
+            "preview_truncated": len(preview_text) >= 1600,
+        }
+
     def _build_summary(self, text: str) -> str:
         compact = " ".join(text.split())
         return compact[:220]
+
+    def _build_preview_text(self, *, chunks: list[dict], summary: str | None) -> str:
+        parts: list[str] = []
+        total_chars = 0
+        for chunk in chunks:
+            payload = chunk.get("payload", {})
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                continue
+            remaining = 1600 - total_chars
+            if remaining <= 0:
+                break
+            snippet = text[:remaining].strip()
+            if snippet:
+                parts.append(snippet)
+                total_chars += len(snippet)
+            if total_chars >= 1600:
+                break
+
+        if parts:
+            return "\n\n".join(parts)
+        return (summary or "").strip()
 
     async def get_file_vector_count(self, *, user_id: str, file_id: str) -> int:
         return await self.qdrant_store.count_by_file(user_id=user_id, file_id=file_id)

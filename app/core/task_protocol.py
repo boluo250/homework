@@ -39,6 +39,7 @@ class TaskToolCall:
 _TASK_CREATE_PREFIXES = ("帮我创建", "帮我建", "创建", "新增", "添加", "记一个", "新建")
 _TASK_DELETE_PREFIXES = ("删除", "移除", "取消")
 _TASK_LIST_HINTS = ("列出", "看看", "显示", "有哪些", "所有", "清单", "列表")
+_TASK_GET_HINTS = ("详情", "具体需求", "任务需求", "具体要求", "要求是什么", "说明")
 
 
 def parse_task_tool_call(message: str) -> TaskToolCall:
@@ -55,8 +56,6 @@ def parse_task_tool_call(message: str) -> TaskToolCall:
             due_at=_extract_due_at(message),
             raw_query=message,
         )
-    if any(token in message for token in _TASK_LIST_HINTS):
-        return TaskToolCall(action=TaskToolAction.LIST, raw_query=message)
     if "完成" in message or "改成" in message or "更新" in message or "修改" in message:
         return TaskToolCall(
             action=TaskToolAction.UPDATE,
@@ -67,6 +66,14 @@ def parse_task_tool_call(message: str) -> TaskToolCall:
             due_at=_extract_due_at(message),
             raw_query=message,
         )
+    if any(token in message for token in _TASK_GET_HINTS) and ("任务" in message or "待办" in message):
+        return TaskToolCall(
+            action=TaskToolAction.GET,
+            title=_extract_quoted_title(message) or _extract_title_hint_for_get(message),
+            raw_query=message,
+        )
+    if any(token in message for token in _TASK_LIST_HINTS):
+        return TaskToolCall(action=TaskToolAction.LIST, raw_query=message)
     return TaskToolCall(action=TaskToolAction.LIST, raw_query=message)
 
 
@@ -163,3 +170,31 @@ def _clean_details(value: str) -> str | None:
     details = re.sub(r"\d{1,2}月\d{1,2}日", "", details)
     details = details.replace("任务", "").strip(" ，。:：")
     return details or None
+
+
+def _extract_title_hint_for_get(message: str) -> str | None:
+    title = _extract_quoted_title(message)
+    if title:
+        return title
+
+    normalized = message
+    for prefix in ("帮我", "请", "麻烦", "查一下", "查查", "看看", "查看", "显示", "告诉我"):
+        normalized = normalized.replace(prefix, "")
+    for suffix in (
+        "的详情",
+        "详情",
+        "的具体需求",
+        "具体需求",
+        "的具体要求",
+        "具体要求",
+        "的任务需求",
+        "任务需求",
+        "要求是什么",
+        "说明",
+    ):
+        normalized = normalized.replace(suffix, "")
+    normalized = normalized.replace("待办", "").strip(" ，。:：")
+    if normalized.endswith("任务"):
+        normalized = normalized[:-2]
+    normalized = normalized.strip(" ，。:：")
+    return normalized or None
