@@ -272,11 +272,6 @@ async function refreshFiles(userId = "") {
           <div class="file-topline">
             <strong>${escapeHtml(file.filename)}</strong>
           </div>
-          <div class="file-stats">
-            <span class="type-tag">${escapeHtml(file.content_type || guessContentType(file.filename))}</span>
-            <span class="type-tag">向量 ${Number(file.vector_count || 0)}</span>
-          </div>
-          <p class="muted">${escapeHtml(file.summary || "暂无摘要")}</p>
         </div>
       </label>
       <div class="file-actions">
@@ -390,13 +385,14 @@ async function pollResearchJob(jobId, messageId) {
     await delay(RESEARCH_POLL_INTERVAL_MS);
     const response = await fetch(`/api/research?job_id=${encodeURIComponent(jobId)}`);
     const payload = await response.json();
-    setResearchStatus(payload.status);
+    const phase = payload.phase || payload.state?.phase || payload.status;
+    setResearchStatus(phase);
     if (payload.report_markdown) {
       dom.reportBox.textContent = payload.report_markdown;
     }
     updateMessage(messageId, "", {
       thinking: payload.status !== "completed" && payload.status !== "failed",
-      thinkingLabel: researchThinkingLabel(payload.status),
+      thinkingLabel: researchThinkingLabel(phase),
     });
     if (payload.status === "completed" || payload.status === "failed") {
       if (payload.status === "completed") {
@@ -513,6 +509,7 @@ function setResearchStatus(status) {
 function researchStatusLabel(status) {
   const labels = {
     idle: "idle",
+    queued: "排队中",
     pending: "已提交",
     planning: "规划中",
     searching: "检索中",
@@ -529,6 +526,7 @@ function researchStatusLabel(status) {
 
 function researchThinkingLabel(status) {
   const labels = {
+    queued: "正在等待后台消费者接手",
     pending: "正在接住研究任务",
     planning: "正在拆解研究问题",
     searching: "正在搜索网页资料",

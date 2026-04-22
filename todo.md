@@ -99,6 +99,7 @@
 - [x] 在前端渲染研究报告
 - [x] 设计研究任务的异步执行方案
 - [x] 评估使用 Cloudflare Queues 或 Durable Objects 承载长耗时研究任务
+- [x] 使用 Cloudflare Queues + D1 持久化研究执行状态，替换进程内后台任务
 - [x] 若保持标准 Worker，请实现“提交任务 + 心跳轮询 + 结果回填”模式
 - [x] 为研究任务增加状态字段：`pending/running/completed/failed`
 - [x] 为前端增加研究进度条或处理中提示

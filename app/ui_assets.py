@@ -49,7 +49,7 @@ INDEX_HTML = """<!doctype html>
             <input id="fileInput" type="file" accept=".txt,.md,.pdf,.docx" />
             <button type="submit" class="ghost-button">上传文件</button>
           </form>
-          <p id="uploadStatus" class="muted">支持 txt、md、pdf、docx，单文件最大 5MB。</p>
+          <p id="uploadStatus" class="muted">支持 txt、md、pdf、docx、png、jpg、jpeg，单文件最大 10MB。</p>
           <div id="fileList" class="stack empty-state">还没有文件</div>
         </section>
       </aside>
@@ -942,11 +942,6 @@ async function refreshFiles(userId = "") {
           <div class="file-topline">
             <strong>${escapeHtml(file.filename)}</strong>
           </div>
-          <div class="file-stats">
-            <span class="type-tag">${escapeHtml(file.content_type || guessContentType(file.filename))}</span>
-            <span class="type-tag">向量 ${Number(file.vector_count || 0)}</span>
-          </div>
-          <p class="muted">${escapeHtml(file.summary || "暂无摘要")}</p>
         </div>
       </label>
       <div class="file-actions">
@@ -1015,8 +1010,8 @@ async function submitResearchJob(query) {
 }
 
 async function pollResearchJob(jobId) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await delay(800);
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await delay(3000);
     const response = await fetch(`/api/research?job_id=${encodeURIComponent(jobId)}`);
     const payload = await response.json();
     dom.researchStatusTag.textContent = payload.status;
@@ -1024,7 +1019,9 @@ async function pollResearchJob(jobId) {
       dom.reportBox.textContent = payload.report_markdown || "无结果";
       return;
     }
-    dom.reportBox.textContent = `研究中... 当前状态：${payload.status}`;
+    const step = payload.current_step ?? "?";
+    const total = payload.total_steps ?? "?";
+    dom.reportBox.textContent = `研究中... 状态：${payload.status}  步骤：${step}/${total}`;
   }
   dom.researchStatusTag.textContent = "timeout";
   dom.reportBox.textContent = "轮询超时，请稍后手动刷新研究结果接口。";

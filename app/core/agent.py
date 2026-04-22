@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from app.core.context import ConversationContextManager
@@ -151,18 +152,38 @@ class AssistantAgent:
         message: str,
         file_ids: list[str] | None,
     ) -> tuple[str, list[ToolResult]]:
+        self._log_file_qa(
+            "start",
+            user_id=user_id,
+            message=message,
+            file_ids=file_ids or [],
+        )
         rag_hits = await self.rag_service.retrieve(
             user_id=user_id,
             query=message,
             file_ids=file_ids,
             limit=6,
         )
+        self._log_file_qa(
+            "retrieved",
+            user_id=user_id,
+            hit_count=len(rag_hits),
+            hit_files=[hit.get("payload", {}).get("filename", "unknown") for hit in rag_hits],
+            file_ids=file_ids or [],
+        )
         tool_results = [ToolResult(name="file_qa", ok=True, content=rag_hits)]
         if not rag_hits:
+            self._log_file_qa("empty_hits", user_id=user_id, file_ids=file_ids or [])
             return "文件问答链路已经接好接口，但当前还没有可用的向量检索结果。", tool_results
 
         all_files = await self.repository.list_files(user_id)
         selected_files = [item for item in all_files if not file_ids or item.id in file_ids]
+        self._log_file_qa(
+            "selected_files",
+            user_id=user_id,
+            selected_count=len(selected_files),
+            selected_files=[item.filename for item in selected_files],
+        )
         file_descriptions = []
         for item in selected_files[:3]:
             summary = (item.summary or "").strip()
@@ -212,7 +233,35 @@ class AssistantAgent:
             f"用户问题：{message}\n\n"
             + _build_document_qa_instruction(question_mode)
         )
-        reply = await self.chat_provider.chat(system_prompt=system_prompt, user_message=user_prompt)
+        self._log_file_qa(
+            "model_call.start",
+            user_id=user_id,
+            question_mode=question_mode,
+            evidence_count=len(evidence_blocks),
+            selected_count=len(selected_files),
+            system_prompt_chars=len(system_prompt),
+            user_prompt_chars=len(user_prompt),
+        )
+        try:
+            reply = await self.chat_provider.chat(system_prompt=system_prompt, user_message=user_prompt)
+        except Exception as exc:
+            self._log_file_qa(
+                "model_call.error",
+                user_id=user_id,
+                error=str(exc),
+            )
+            raise
+        self._log_file_qa(
+            "model_call.done",
+            user_id=user_id,
+            reply_chars=len(reply),
+        )
+        self._log_file_qa(
+            "model_reply",
+            user_id=user_id,
+            preview=reply[:240],
+            provider_failure=self._looks_like_provider_failure(reply),
+        )
         if self._looks_like_provider_failure(reply):
             reply = self._fallback_file_qa_reply(message, rag_hits)
         reply = self._append_file_citations(reply, rag_hits)
@@ -408,6 +457,13 @@ class AssistantAgent:
             lines.append("如果你愿意，我可以继续把它整理成更完整的文档摘要、问答卡片或结构化要点。")
             return "\n".join(lines)
         return "我从文件中检索到的关键信息有：\n" + "\n".join(f"- {item}" for item in snippets)
+
+    def _log_file_qa(self, event: str, **fields) -> None:
+        payload = {"scope": "file_qa", "event": event, **fields}
+        try:
+            print(f"[taskmate] {json.dumps(payload, ensure_ascii=False, default=str)}")
+        except Exception:  # noqa: BLE001
+            print(f"[taskmate] file_qa event={event} fields={fields!r}")
 
 
 def _extract_name(message: str, *, allow_standalone: bool = False) -> str | None:

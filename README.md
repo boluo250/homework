@@ -15,7 +15,7 @@ This repository contains a lightweight Cloudflare Worker MVP for a conversationa
 - D1-compatible schema in [`migrations/001_init.sql`](/Users/kkk/kkk-magic/homework/migrations/001_init.sql)
 - Intent routing, task tool protocol, context window manager, and task CRUD repository
 - File upload, Mistral OCR PDF parsing, DOCX/text extraction, chunking, local vector search, and file deletion
-- Async research job submission plus polling with markdown report output
+- Queue-backed research job submission plus polling with markdown report output
 - Serper and OpenRouter HTTP client wiring with graceful fallback when secrets are missing
 - Profile completion gating when name or email is missing
 - Assistant nickname persistence and frontend display sync
@@ -62,9 +62,11 @@ tests/
    `npx wrangler secret put MISTRAL_API_KEY`
    `npx wrangler secret put SERPER_API_KEY`
    `npx wrangler secret put QDRANT_API_KEY`
-5. Apply the schema:
+5. Create the research queue:
+   `npx wrangler queues create taskmate-research-jobs`
+6. Apply the schema:
    `npx wrangler d1 execute taskmate-homework-db --file migrations/001_init.sql --remote`
-6. Deploy:
+7. Deploy:
    `npx wrangler deploy`
 
 ## Runtime adapters
@@ -90,7 +92,7 @@ tests/
 
 ## Current Limits
 
-- Deep research is still a lightweight planner plus async polling MVP, not a durable multi-worker pipeline yet.
+- Deep research now uses Cloudflare Queue backed background execution plus D1-persisted step state, but still keeps a single-worker producer/consumer topology for simplicity.
 - The embedding layer now supports a real remote API, but local development still falls back to deterministic vectors when embedding credentials are absent.
 - File management currently supports upload, list, select, rename, and delete.
 - Image OCR depends on `MISTRAL_API_KEY`; without it, image parsing will fail fast with a clear error.
@@ -98,7 +100,7 @@ tests/
 ## Deployment notes
 
 - Standard Worker is enough for chat, task CRUD, and lightweight search.
-- Research mode should evolve toward async execution with queue or polling instead of a single long request.
+- Research mode now runs through Cloudflare Queues and D1-persisted job state instead of in-process background tasks.
 - RAG must keep strict `user_id` and optional `file_id` metadata filters in Qdrant.
 - The current repo uses local adapters for R2/Qdrant behavior during development; swap those adapters to Cloudflare R2 and Qdrant Cloud bindings for production.
 - When `DB` and `FILES_BUCKET` bindings are present, the app now uses the real Cloudflare adapters automatically.

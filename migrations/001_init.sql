@@ -83,8 +83,24 @@ CREATE TABLE IF NOT EXISTS research_jobs (
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS research_job_states (
+  job_id TEXT PRIMARY KEY,
+  phase TEXT NOT NULL DEFAULT 'queued',
+  current_step INTEGER NOT NULL DEFAULT 0,
+  total_steps INTEGER NOT NULL DEFAULT 0,
+  plan_json TEXT,
+  findings_json TEXT,
+  references_json TEXT,
+  last_error TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (job_id) REFERENCES research_jobs(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_users_client_id ON users(client_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_user_id_status ON tasks(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_created_at ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id);
 CREATE INDEX IF NOT EXISTS idx_research_jobs_user_id_status ON research_jobs(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_research_job_states_phase ON research_job_states(phase, updated_at);

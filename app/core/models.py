@@ -140,6 +140,24 @@ class ResearchJob:
 
 
 @dataclass(slots=True)
+class ResearchJobState:
+    job_id: str
+    phase: str = "queued"
+    current_step: int = 0
+    total_steps: int = 0
+    plan_json: str | None = None
+    findings_json: str | None = None
+    references_json: str | None = None
+    last_error: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str = field(default_factory=utc_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class ToolResult:
     name: str
     ok: bool

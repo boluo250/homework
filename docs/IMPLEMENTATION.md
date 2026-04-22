@@ -14,7 +14,7 @@ The repository now has a minimal but coherent MVP scaffold:
 - Profile completion gating before normal task/search/research flows when user info is incomplete
 - Assistant nickname sync between persistence layer and frontend UI
 - Task details extraction and rendering in the workspace sidebar
-- Dynamic research plan generation with running progress snapshots and structured final reports
+- Queue-backed research execution with running progress snapshots, persisted step state, and structured final reports
 - File rename support with synchronized Qdrant payload metadata updates
 - Semantic long-term memory retrieval based on stored conversation vectors
 - Image OCR support for `.png/.jpg/.jpeg` routed through the same OCR and vectorization flow as PDFs
@@ -43,7 +43,7 @@ flowchart LR
   Worker --> Agent["Agent / Intent Router"]
   Agent --> Repo["SQLite local adapter<br/>D1-compatible schema"]
   Agent --> Search["Serper search service"]
-  Agent --> Research["Async research service"]
+  Agent --> Research["Queue-backed research service"]
   Agent --> Files["File upload + RAG service"]
   Files --> R2["Local R2 adapter"]
   Files --> Qdrant["Local Qdrant-style vector store"]
@@ -52,7 +52,7 @@ flowchart LR
 ## Worker Strategy
 
 - Standard Worker remains the recommended deployment target for the MVP because chat, task CRUD, lightweight search, and file upload are all short-lived requests.
-- Deep research should not stay inside a single request. The current code uses "submit + poll" so the UI can survive long-running research without blocking the request.
+- Deep research should not stay inside a single request. The current code now uses "submit + queue + poll" so the UI can survive long-running research without blocking the request.
 - Unbound Worker is not necessary for the MVP, but it can be reconsidered if the product later centralizes heavier fetch-and-summarize workloads inside one runtime instead of queueing them.
 
 ## Deployment steps
@@ -60,8 +60,9 @@ flowchart LR
 1. create D1 and R2 resources
 2. bind them in `wrangler.toml`
 3. set OpenRouter, Mistral OCR, Serper, and Qdrant secrets
-4. run the initial D1 schema apply command
-5. deploy with Wrangler
+4. create the Cloudflare Queue used by research jobs
+5. run the initial D1 schema apply command
+6. deploy with Wrangler
 
 This keeps the code path identical between preview and production, with only the bindings and secrets changing.
 
@@ -77,26 +78,20 @@ This matches the TODO constraint that model context must not grow forever.
 
 ## Research design
 
-Research mode is intentionally scaffolded as a plan-first flow:
+Research mode is now implemented as a durable queue-backed flow:
 
 1. Detect deep-research intent
 2. Build a small plan with 3 to 5 sub-steps
-3. Return a structured placeholder response
-
-Next iteration:
-
-- Persist `research_jobs`
-- Submit async work
-- Poll job status from the UI
-- Render final markdown reports
-
-The current code now implements a local async version of this flow in `ResearchService`, which matches the intended "submit + poll" interaction pattern for standard Workers.
+3. Persist `research_jobs` and `research_job_states`
+4. Send the job into Cloudflare Queue
+5. Let the queue consumer execute one sub-step at a time and write progress back to D1
+6. Poll the job state from the UI and render the final markdown report
 
 ## Queue and Durable Object assessment
 
-- Cloudflare Queues is the cleaner production choice when research steps need durable retry, delayed execution, or backpressure control.
-- Durable Objects becomes attractive if research jobs need shared mutable coordination, streamed progress, or per-job event fan-out.
-- For the interview MVP, a standard Worker plus persisted `research_jobs` and polling keeps the architecture simpler while still showing that the long-running path has been separated from the request-response path.
+- Cloudflare Queues is now the selected execution model because Free-plan Workflows limits are too restrictive for multi-step research jobs.
+- Durable Objects still becomes attractive if research jobs later need shared mutable coordination, streamed progress, or per-job event fan-out.
+- The current implementation keeps the topology simple: one Worker acts as both producer and consumer, while D1 stores durable state and the UI only polls persisted progress.
 
 ## Sub-agent planning
 
@@ -132,14 +127,13 @@ The next production step is to replace the local adapters with real R2 and Qdran
 
 ## Planned next slice
 
-1. Make research execution durable across worker restarts instead of relying on in-process async tasks
-2. Add stronger source attribution formatting inside generated report paragraphs, not only as a trailing references section
-3. Extend memory retrieval with stronger de-duplication and recency balancing
-4. Add richer multimodal ingestion on top of the current text-first RAG pipeline
+1. Add stronger source attribution formatting inside generated report paragraphs, not only as a trailing references section
+2. Extend memory retrieval with stronger de-duplication and recency balancing
+3. Add richer multimodal ingestion on top of the current text-first RAG pipeline
 
 ## Challenges and solutions
 
-- Worker runtime constraints: long research chains are moved behind async job submission and polling instead of a single blocking request.
+- Worker runtime constraints: long research chains are moved behind Cloudflare Queue consumer execution and D1-persisted polling instead of in-process background tasks.
 - Context growth: the context manager keeps a summary plus a bounded recent-message buffer to stop prompt size from growing forever.
 - Local development without cloud credentials: the code uses local adapters that preserve the same interfaces and metadata contracts as the planned cloud services.
 - RAG isolation: every stored chunk carries `user_id` and optional `file_id` filters so retrieval never falls back to broad unscoped search.

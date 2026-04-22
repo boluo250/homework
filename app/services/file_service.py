@@ -28,7 +28,7 @@ class FileService:
         qdrant_store: QdrantStore,
         pdf_parse_service: PdfParseService | None = None,
         *,
-        max_size_bytes: int = 5 * 1024 * 1024,
+        max_size_bytes: int = 10 * 1024 * 1024,
     ) -> None:
         self.repository = repository
         self.file_store = file_store
@@ -55,7 +55,7 @@ class FileService:
         except binascii.Error as exc:
             raise ValueError("Invalid base64 file payload") from exc
         if len(content) > self.max_size_bytes:
-            raise ValueError(f"File exceeds max size of {self.max_size_bytes} bytes")
+            raise ValueError(f"File exceeds max size of {_format_size_mb(self.max_size_bytes)}")
 
         r2_key = await self.file_store.save_file(filename, content)
         try:
@@ -147,3 +147,7 @@ class FileService:
 
     async def get_file_vector_count(self, *, user_id: str, file_id: str) -> int:
         return await self.qdrant_store.count_by_file(user_id=user_id, file_id=file_id)
+
+
+def _format_size_mb(size_bytes: int) -> str:
+    return f"{size_bytes / (1024 * 1024):.0f} MB"

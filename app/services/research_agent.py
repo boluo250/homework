@@ -95,6 +95,19 @@ class ResearchAgent:
         )
         return await self._synthesize_report(query=query, plan=plan, findings=findings, references=references)
 
+    async def execute_step(self, *, query: str, step: ResearchPlanStep) -> ResearchStepResult:
+        return await self._run_step(query=query, step=step)
+
+    async def synthesize_report(
+        self,
+        *,
+        query: str,
+        plan: list[ResearchPlanStep],
+        findings: list[ResearchStepResult],
+        references: list[dict],
+    ) -> str:
+        return await self._synthesize_report(query=query, plan=plan, findings=findings, references=references)
+
     def build_plan(self, query: str) -> list[ResearchPlanStep]:
         lowered = query.lower()
         normalized = query.strip()

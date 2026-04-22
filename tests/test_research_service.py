@@ -53,6 +53,14 @@ class FakeChatProvider(ChatProviderBase):
         )
 
 
+class FakeQueueBinding:
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+
+    async def send(self, payload: dict) -> None:
+        self.messages.append(payload)
+
+
 def test_research_service_generates_structured_report() -> None:
     async def run() -> None:
         repository = InMemoryAppRepository()
@@ -74,6 +82,65 @@ def test_research_service_generates_structured_report() -> None:
         assert "## 关键发现" in report
         assert "## 方案对比" in report
         assert "## 参考来源" in report
+
+    asyncio.run(run())
+
+
+def test_research_service_queue_mode_persists_state_and_completes() -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        queue = FakeQueueBinding()
+        service = ResearchService(
+            repository=repository,
+            search_service=FakeSearchService(),
+            web_fetch_service=FakeWebFetchService(),
+            chat_provider=FakeChatProvider(),
+            queue_binding=queue,
+        )
+        job = await service.submit(client_id="client_research_queue", query="Cloudflare Worker 上做 RAG 的轻量实现方案")
+        assert job["status"] == "queued"
+        assert queue.messages
+
+        while queue.messages:
+            message = queue.messages.pop(0)
+            await service.process_queue_message(message)
+            current = await service.get(job["id"])
+            if current and current["status"] == "completed":
+                break
+
+        current = await service.get(job["id"])
+        assert current is not None
+        assert current["status"] == "completed"
+        assert current["phase"] == "completed"
+        assert current["current_step"] == current["total_steps"]
+
+    asyncio.run(run())
+
+
+def test_research_service_get_resumes_stalled_queue_job_without_consumer() -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        queue = FakeQueueBinding()
+        service = ResearchService(
+            repository=repository,
+            search_service=FakeSearchService(),
+            web_fetch_service=FakeWebFetchService(),
+            chat_provider=FakeChatProvider(),
+            queue_binding=queue,
+            stalled_job_timeout_seconds=0,
+        )
+        job = await service.submit(client_id="client_research_resume", query="Cloudflare Worker 上做 RAG 的轻量实现方案")
+        assert job["status"] == "queued"
+        assert queue.messages
+
+        current = await service.get(job["id"], drive_stalled=True)
+        while current and current["status"] not in {"completed", "failed"}:
+            current = await service.get(job["id"], drive_stalled=True)
+
+        assert current is not None
+        assert current["status"] == "completed"
+        assert current["phase"] == "completed"
+        assert current["current_step"] == current["total_steps"]
 
     asyncio.run(run())
 

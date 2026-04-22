@@ -14,7 +14,7 @@ class OpenRouterChatProvider(ChatProviderBase):
         model: str = "openrouter/auto",
         timeout_seconds: float = 20.0,
         app_name: str = "TaskMate",
-        max_tokens: int = 1800,
+        max_tokens: int = 4000,
     ) -> None:
         self.api_key = api_key
         self.model = model

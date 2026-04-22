@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -121,6 +122,7 @@ class AppContainer:
             search_service=search_service,
             web_fetch_service=WebFetchService(),
             chat_provider=chat_provider,
+            queue_binding=getattr(env, "RESEARCH_QUEUE", None),
         )
         self.agent = AssistantAgent(
             repository=repository,
@@ -196,6 +198,16 @@ async def route_request(request: HttpRequest, container: AppContainer) -> HttpRe
         return _with_cors(await handle_files(request, container.repository, container.file_service))
     if request.path == "/api/research":
         return _with_cors(await handle_research(request, container.research_service))
+    if request.path == "/api/debug/research":
+        job_id = request.query.get("job_id", "").strip()
+        if not job_id:
+            return _with_cors(HttpResponse.json({"error": "job_id required"}, status=400))
+        job = await container.repository.get_research_job(job_id)
+        state = await container.repository.get_research_job_state(job_id)
+        return _with_cors(HttpResponse.json({
+            "job": job.to_dict() if job else None,
+            "state": state.to_dict() if state else None,
+        }))
     if request.path == "/api/admin/reset":
         return _with_cors(
             await handle_admin_reset(
@@ -224,3 +236,58 @@ class Default(WorkerEntrypoint):
         container = get_container(self.env)
         response = await route_request(http_request, container)
         return Response(response.body, status=response.status, headers=response.headers)
+
+    async def queue(self, batch) -> None:
+        import traceback as _tb
+        container = get_container(self.env)
+        print(
+            f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'batch.start', 'message_count': len(getattr(batch, 'messages', []) or [])}, ensure_ascii=False)}"
+        )
+        for message in getattr(batch, "messages", []):
+            try:
+                print(
+                    f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.start', 'attempts': getattr(message, 'attempts', None)}, ensure_ascii=False, default=str)}"
+                )
+                await container.research_service.process_queue_message(message.body)
+                print(f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.ok'}, ensure_ascii=False)}")
+                if hasattr(message, "ack"):
+                    message.ack()
+            except Exception as exc:  # noqa: BLE001
+                _full_error = _tb.format_exc()
+                job_id = ""
+                body = getattr(message, "body", None)
+                if isinstance(body, dict):
+                    job_id = str(body.get("job_id", "")).strip()
+                elif isinstance(body, str):
+                    try:
+                        job_id = str(json.loads(body).get("job_id", "")).strip()
+                    except Exception:  # noqa: BLE001
+                        job_id = ""
+                elif body is not None and hasattr(body, "to_py"):
+                    try:
+                        py_body = body.to_py()
+                        if isinstance(py_body, dict):
+                            job_id = str(py_body.get("job_id", "")).strip()
+                    except Exception:  # noqa: BLE001
+                        job_id = ""
+                elif body is not None and hasattr(body, "get"):
+                    try:
+                        job_id = str(body.get("job_id") or "").strip()
+                    except Exception:  # noqa: BLE001
+                        job_id = ""
+                print(
+                    f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.error', 'job_id': job_id, 'error': str(exc)}, ensure_ascii=False)}"
+                )
+                if job_id:
+                    attempts = int(getattr(message, "attempts", 1) or 1)
+                    error_detail = f"{exc}\n\n```\n{_full_error}\n```"
+                    if attempts >= 3:
+                        await container.research_service.mark_failed(job_id, error_detail)
+                        if hasattr(message, "ack"):
+                            message.ack()
+                    else:
+                        await container.research_service.mark_retry(job_id, error_detail)
+                        if hasattr(message, "retry"):
+                            message.retry()
+                elif hasattr(message, "ack"):
+                    message.ack()

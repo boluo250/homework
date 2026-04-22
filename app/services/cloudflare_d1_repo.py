@@ -10,6 +10,7 @@ from app.core.models import (
     FileRecord,
     MessageRole,
     ResearchJob,
+    ResearchJobState,
     TaskPriority,
     TaskRecord,
     TaskStatus,
@@ -452,6 +453,113 @@ class CloudflareD1Repository(AppRepository):
         row = await self._first("SELECT * FROM research_jobs WHERE id = ?", (job_id,))
         return _row_to_research_job(row) if row else None
 
+    async def create_research_job_state(
+        self,
+        job_id: str,
+        *,
+        phase: str = "queued",
+        current_step: int = 0,
+        total_steps: int = 0,
+        plan_json: str | None = None,
+        findings_json: str | None = None,
+        references_json: str | None = None,
+        last_error: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> ResearchJobState:
+        await self._ensure_schema()
+        payload = ResearchJobState(
+            job_id=job_id,
+            phase=phase,
+            current_step=current_step,
+            total_steps=total_steps,
+            plan_json=plan_json,
+            findings_json=findings_json,
+            references_json=references_json,
+            last_error=last_error,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+        await self._run(
+            """
+            INSERT INTO research_job_states
+            (job_id, phase, current_step, total_steps, plan_json, findings_json, references_json, last_error, started_at, completed_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.job_id,
+                payload.phase,
+                payload.current_step,
+                payload.total_steps,
+                payload.plan_json,
+                payload.findings_json,
+                payload.references_json,
+                payload.last_error,
+                payload.started_at,
+                payload.completed_at,
+                payload.updated_at,
+            ),
+        )
+        return payload
+
+    async def update_research_job_state(
+        self,
+        job_id: str,
+        *,
+        phase: str | None = None,
+        current_step: int | None = None,
+        total_steps: int | None = None,
+        plan_json: str | None = None,
+        findings_json: str | None = None,
+        references_json: str | None = None,
+        last_error: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> ResearchJobState | None:
+        current = await self.get_research_job_state(job_id)
+        if not current:
+            return None
+        next_payload = ResearchJobState(
+            job_id=job_id,
+            phase=current.phase if phase is None else phase,
+            current_step=current.current_step if current_step is None else current_step,
+            total_steps=current.total_steps if total_steps is None else total_steps,
+            plan_json=current.plan_json if plan_json is None else plan_json,
+            findings_json=current.findings_json if findings_json is None else findings_json,
+            references_json=current.references_json if references_json is None else references_json,
+            last_error=current.last_error if last_error is None else last_error,
+            started_at=current.started_at if started_at is None else started_at,
+            completed_at=current.completed_at if completed_at is None else completed_at,
+        )
+        updated_at = utc_now_iso()
+        await self._run(
+            """
+            UPDATE research_job_states
+            SET phase = ?, current_step = ?, total_steps = ?, plan_json = ?, findings_json = ?, references_json = ?, last_error = ?, started_at = ?, completed_at = ?, updated_at = ?
+            WHERE job_id = ?
+            """,
+            (
+                next_payload.phase,
+                next_payload.current_step,
+                next_payload.total_steps,
+                next_payload.plan_json,
+                next_payload.findings_json,
+                next_payload.references_json,
+                next_payload.last_error,
+                next_payload.started_at,
+                next_payload.completed_at,
+                updated_at,
+                job_id,
+            ),
+        )
+        next_payload.updated_at = updated_at
+        return next_payload
+
+    async def get_research_job_state(self, job_id: str) -> ResearchJobState | None:
+        await self._ensure_schema()
+        row = await self._first("SELECT * FROM research_job_states WHERE job_id = ?", (job_id,))
+        return _row_to_research_job_state(row) if row else None
+
     async def reset_all_data(self) -> None:
         await self._ensure_schema()
         for table in (
@@ -462,6 +570,7 @@ class CloudflareD1Repository(AppRepository):
             "tasks",
             "files",
             "research_jobs",
+            "research_job_states",
             "users",
         ):
             await self._run(f"DELETE FROM {table}")
@@ -614,5 +723,21 @@ def _row_to_research_job(row: dict[str, Any]) -> ResearchJob:
         status=row["status"],
         report_markdown=row.get("report_markdown"),
         created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_research_job_state(row: dict[str, Any]) -> ResearchJobState:
+    return ResearchJobState(
+        job_id=row["job_id"],
+        phase=row["phase"],
+        current_step=int(row["current_step"]),
+        total_steps=int(row["total_steps"]),
+        plan_json=row.get("plan_json"),
+        findings_json=row.get("findings_json"),
+        references_json=row.get("references_json"),
+        last_error=row.get("last_error"),
+        started_at=row.get("started_at"),
+        completed_at=row.get("completed_at"),
         updated_at=row["updated_at"],
     )
