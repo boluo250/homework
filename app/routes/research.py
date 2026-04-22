@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 
 from app.core.http import HttpRequest, HttpResponse
+from app.tools.research_tool import ResearchTool
 
 
-async def handle_research(request: HttpRequest, research_service) -> HttpResponse:
+async def handle_research(request: HttpRequest, research_service, *, research_tool: ResearchTool | None = None) -> HttpResponse:
+    research_tool = research_tool or ResearchTool(research_state=None, research_service=research_service)
     if request.method == "POST":
         payload = request.json_data or {}
         query = str(payload.get("query", "")).strip()
@@ -15,7 +17,7 @@ async def handle_research(request: HttpRequest, research_service) -> HttpRespons
         )
         if not query or not client_id:
             return HttpResponse.json({"error": "query and client_id are required"}, status=400)
-        job = await research_service.submit(client_id=client_id, query=query)
+        job = await research_tool.create_job(client_id=client_id, query=query)
         return HttpResponse.json(job, status=202)
 
     if request.method == "GET":
@@ -25,7 +27,7 @@ async def handle_research(request: HttpRequest, research_service) -> HttpRespons
         )
         if not job_id:
             return HttpResponse.json({"error": "job_id is required"}, status=400)
-        job = await research_service.get(job_id, drive_stalled=True)
+        job = await research_tool.get_job(job_id)
         if not job:
             return HttpResponse.json({"error": "job not found"}, status=404)
         return HttpResponse.json(job)

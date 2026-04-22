@@ -48,7 +48,12 @@ def build_system_prompt(
         f"User profile: name={user.name or 'unknown'}, email={user.email or 'unknown'}."
     )
     assistant_line = f"Assistant nickname: {assistant_name}."
-    context_parts = [BASE_SYSTEM_PROMPT, assistant_line, profile_line, INTENT_PROMPTS[intent]]
+    addressing_line = (
+        f"When replying in natural conversation, address the user as {user.name} when it feels natural."
+        if user.name
+        else "The user's preferred name is not known yet."
+    )
+    context_parts = [BASE_SYSTEM_PROMPT, assistant_line, profile_line, addressing_line, INTENT_PROMPTS[intent]]
     if summary:
         context_parts.append(f"Conversation summary:\n{summary}")
     if recent_messages:

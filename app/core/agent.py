@@ -2,17 +2,28 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
-from app.core.context import ConversationContextManager
-from app.core.intents import identify_intent
-from app.core.models import ChatRequest, ChatResponse, Intent, ToolResult
-from app.core.prompts import build_system_prompt
-from app.core.task_protocol import TaskToolAction, parse_task_tool_call
-from app.providers.llm_base import ChatProviderBase
+from app.core.intent_interpreter import IntentInterpretation, LLMIntentInterpreter
+from app.core.models import ChatRequest, ChatResponse, Intent, TaskPriority, TaskStatus, ToolResult
+from app.core.task_protocol import TaskToolAction, is_generic_task_reference
+from app.providers.llm_base import ChatProviderBase, ToolCall, ToolDefinition
+from app.runtime.prompt_builder import build_chat_system_prompt, build_tool_router_prompt
+from app.runtime.session_context import ConversationContextManager
+from app.runtime.skills_loader import SkillsLoader
+from app.runtime.tool_registry import ToolRegistry
 from app.services.d1_repo import AppRepository
 from app.services.memory_service import MemoryService
 from app.services.rag_service import RagService
 from app.services.search_service import SearchService
+from app.state.assistant_state import AssistantState
+from app.state.task_state import TaskState
+from app.state.user_state import UserState
+from app.tools.assistant_identity_tool import AssistantIdentityTool
+from app.tools.profile_tool import ProfileTool
+from app.tools.rag_tool import RagTool
+from app.tools.research_tool import ResearchTool
+from app.tools.task_tool import TaskTool
 
 
 class AssistantAgent:
@@ -24,6 +35,13 @@ class AssistantAgent:
         rag_service: RagService,
         memory_service: MemoryService | None = None,
         context_manager: ConversationContextManager | None = None,
+        profile_tool: ProfileTool | None = None,
+        assistant_identity_tool: AssistantIdentityTool | None = None,
+        task_tool: TaskTool | None = None,
+        rag_tool: RagTool | None = None,
+        research_tool: ResearchTool | None = None,
+        tool_registry: ToolRegistry | None = None,
+        skills_loader: SkillsLoader | None = None,
     ) -> None:
         self.repository = repository
         self.chat_provider = chat_provider
@@ -31,6 +49,17 @@ class AssistantAgent:
         self.rag_service = rag_service
         self.memory_service = memory_service
         self.context_manager = context_manager or ConversationContextManager()
+        self.intent_interpreter = LLMIntentInterpreter(chat_provider)
+        self.user_state = UserState(repository)
+        self.assistant_state = AssistantState(repository)
+        self.task_state = TaskState(repository)
+        self.profile_tool = profile_tool or ProfileTool(self.user_state)
+        self.assistant_identity_tool = assistant_identity_tool or AssistantIdentityTool(self.assistant_state)
+        self.task_tool = task_tool or TaskTool(self.task_state)
+        self.rag_tool = rag_tool
+        self.research_tool = research_tool or ResearchTool(None)
+        self.tool_registry = tool_registry or ToolRegistry()
+        self.skills_loader = skills_loader or SkillsLoader()
 
     async def handle_chat(self, request: ChatRequest) -> ChatResponse:
         user = await self.repository.get_or_create_user(request.client_id)
@@ -47,19 +76,6 @@ class AssistantAgent:
                 content=request.message,
             )
 
-        self._maybe_extract_profile_updates(request.message)
-        bot_name_updated = False
-        if extracted_email := _extract_email(request.message):
-            user = await self.repository.update_user_profile(user.id, email=extracted_email)
-        if extracted_name := _extract_name(request.message, allow_standalone=not bool(user.name)):
-            user = await self.repository.update_user_profile(user.id, name=extracted_name)
-        if bot_name := _extract_bot_name(request.message):
-            settings = await self.repository.update_assistant_name(user.id, bot_name)
-            bot_name_updated = True
-
-        intent = identify_intent(request.message, file_ids=request.file_ids)
-        tool_results: list[ToolResult] = []
-
         messages = await self.repository.list_messages(conversation.id)
         summary = await self.repository.get_summary(conversation.id)
         context_bundle = self.context_manager.build(messages, summary)
@@ -70,56 +86,40 @@ class AssistantAgent:
                 context_bundle.source_message_count,
             )
 
-        profile_completed_this_turn = profile_was_incomplete and not user.needs_profile_completion
-
-        if user.needs_profile_completion:
-            reply = self._build_profile_completion_reply(user, settings.bot_name)
-        elif profile_completed_this_turn or intent == Intent.COLLECT_USER_PROFILE:
-            reply = self._build_profile_saved_reply(user, settings.bot_name, bot_name_updated=bot_name_updated)
-        elif intent == Intent.TASK_CRUD:
-            reply, tool_results = await self._handle_task_intent(user.id, request.message)
-        elif intent == Intent.SEARCH_WEB:
-            results = await self.search_service.search(request.message)
-            tool_results = [ToolResult(name="search_web", ok=True, content=results)]
-            bullets = "\n".join(f"- {item['title']}: {item['snippet']}" for item in results)
-            reply = f"我先帮你整理了搜索结果：\n{bullets}"
-        elif intent == Intent.DEEP_RESEARCH:
-            plan = self._build_research_plan(request.message)
-            tool_results = [
-                ToolResult(name="deep_research_plan", ok=True, content=plan),
-                ToolResult(name="deep_research_job", ok=True, content={"mode": "async"}),
-            ]
-            reply = (
-                "我已经开始真正执行这次研究了：会先拆题，再做网页检索、正文阅读和结论汇总。"
-                "下方研究结果区会持续刷新进度，这里先把研究计划同步给你：\n"
-                + "\n".join(f"- {item}" for item in plan)
-            )
-        elif intent == Intent.FILE_QA:
-            reply, tool_results = await self._handle_file_qa(
-                user_id=user.id,
-                message=request.message,
-                file_ids=request.file_ids,
+        tasks = await self.repository.list_tasks(user.id)
+        if self.chat_provider.supports_tool_calls():
+            outcome = await self._handle_tool_routed_turn(
+                request=request,
+                user=user,
+                settings=settings,
+                context_bundle=context_bundle,
+                tasks=tasks,
+                profile_was_incomplete=profile_was_incomplete,
             )
         else:
-            semantic_memories = await self._load_semantic_memories(user.id, request.message)
-            prompt = build_system_prompt(
-                intent,
-                user,
-                assistant_name=settings.bot_name,
-                summary=context_bundle.summary_text,
-                recent_messages=context_bundle.recent_lines,
-                semantic_memories=semantic_memories,
+            outcome = await self._handle_interpreted_turn(
+                request=request,
+                user=user,
+                settings=settings,
+                context_bundle=context_bundle,
+                tasks=tasks,
+                profile_was_incomplete=profile_was_incomplete,
             )
-            reply = await self.chat_provider.chat(system_prompt=prompt, user_message=request.message)
-            if user.needs_profile_completion and intent != Intent.COLLECT_USER_PROFILE:
-                missing = []
-                if not user.name:
-                    missing.append("名字")
-                if not user.email:
-                    missing.append("邮箱")
-                reply = f"{reply}\n\n顺便告诉我你的{'和'.join(missing)}，我后面就能更准确地记住你。"
 
-        assistant_message_record = await self.repository.add_message(conversation.id, "assistant", reply)
+        user = outcome["user"]
+        settings = outcome["settings"]
+        intent = outcome["intent"]
+        tool_results = outcome["tool_results"]
+        reply = outcome["reply"]
+
+        reply = self._personalize_reply(reply, user.name, intent=intent)
+
+        assistant_message_record = await self.repository.add_message(
+            conversation.id,
+            "assistant",
+            reply,
+            tool_calls_json=json.dumps([item.to_dict() for item in tool_results], ensure_ascii=False) if tool_results else None,
+        )
         if self.memory_service is not None:
             await self.memory_service.store_message(
                 user_id=user.id,
@@ -145,6 +145,389 @@ class AssistantAgent:
             "assistant_name": settings.bot_name,
         }
 
+    async def _handle_tool_routed_turn(
+        self,
+        *,
+        request: ChatRequest,
+        user,
+        settings,
+        context_bundle,
+        tasks: list,
+        profile_was_incomplete: bool,
+    ) -> dict[str, Any]:
+        tool_response = await self.chat_provider.chat_with_tools(
+            system_prompt=self._build_tool_router_prompt(
+                user=user,
+                assistant_name=settings.bot_name,
+                summary=context_bundle.summary_text,
+                recent_messages=context_bundle.recent_lines,
+                tasks=tasks,
+                message=request.message,
+                file_ids=request.file_ids,
+            ),
+            user_message=request.message,
+            tools=self._build_business_tools(file_ids=request.file_ids),
+        )
+
+        if self._looks_like_provider_failure(tool_response.content or ""):
+            return await self._handle_interpreted_turn(
+                request=request,
+                user=user,
+                settings=settings,
+                context_bundle=context_bundle,
+                tasks=tasks,
+                profile_was_incomplete=profile_was_incomplete,
+            )
+
+        if not tool_response.tool_calls:
+            if tool_response.content:
+                return {
+                    "intent": Intent.GENERAL_CHAT,
+                    "reply": tool_response.content,
+                    "tool_results": [],
+                    "user": user,
+                    "settings": settings,
+                }
+            return await self._handle_interpreted_turn(
+                request=request,
+                user=user,
+                settings=settings,
+                context_bundle=context_bundle,
+                tasks=tasks,
+                profile_was_incomplete=profile_was_incomplete,
+            )
+
+        primary_intent = Intent.GENERAL_CHAT
+        tool_results: list[ToolResult] = []
+        reply_parts: list[str] = []
+        ordered_calls = self._order_tool_calls(tool_response.tool_calls)
+        bot_name_updated = False
+
+        for tool_call in ordered_calls:
+            tool_name = tool_call.name
+            args = tool_call.arguments or {}
+
+            if tool_name == "save_profile":
+                name = _clean_tool_text(args.get("name"))
+                email = _clean_tool_email(args.get("email"))
+                if name or email:
+                    user = await self.profile_tool.set(user.id, name=name, email=email)
+                    tool_results.append(
+                        ToolResult(
+                            name="save_profile",
+                            ok=True,
+                            content={"name": user.name, "email": user.email},
+                        )
+                    )
+                    primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+                else:
+                    tool_results.append(ToolResult(name="save_profile", ok=False, content={"reason": "missing_profile_fields"}))
+                continue
+
+            if tool_name == "recall_profile":
+                field = _normalize_profile_field(args.get("field"))
+                reply_parts.append(await self.profile_tool.get(user, field))
+                tool_results.append(ToolResult(name="recall_profile", ok=True, content={"field": field}))
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+                continue
+
+            if tool_name == "rename_assistant":
+                assistant_name = _clean_tool_text(args.get("assistant_name"))
+                if assistant_name:
+                    settings = await self.assistant_identity_tool.set(user.id, assistant_name)
+                    bot_name_updated = True
+                    reply_parts.append(f"以后你可以叫我 {settings.bot_name}。")
+                    tool_results.append(
+                        ToolResult(
+                            name="rename_assistant",
+                            ok=True,
+                            content={"assistant_name": settings.bot_name},
+                        )
+                    )
+                    primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+                else:
+                    tool_results.append(ToolResult(name="rename_assistant", ok=False, content={"reason": "missing_assistant_name"}))
+                continue
+
+            if tool_name == "get_assistant_name":
+                settings = await self.assistant_identity_tool.get(user.id)
+                reply_parts.append(f"你现在叫我 {settings.bot_name}。")
+                tool_results.append(ToolResult(name="get_assistant_name", ok=True, content={"assistant_name": settings.bot_name}))
+                continue
+
+            if tool_name in {
+                TaskToolAction.CREATE.value,
+                TaskToolAction.UPDATE.value,
+                TaskToolAction.DELETE.value,
+                TaskToolAction.GET.value,
+                TaskToolAction.LIST.value,
+            }:
+                task_reply, task_tool_results, primary_intent = await self._execute_routed_task_call(
+                    user_id=user.id,
+                    message=request.message,
+                    tool_name=tool_name,
+                    args=args,
+                    current_intent=primary_intent,
+                    user=user,
+                    assistant_name=settings.bot_name,
+                )
+                reply_parts.append(task_reply)
+                tool_results.extend(task_tool_results)
+                continue
+
+            if tool_name == "search_web":
+                query = _clean_tool_text(args.get("query")) or request.message
+                results = await self.search_service.search(query)
+                tool_results.append(ToolResult(name="search_web", ok=True, content=results))
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.SEARCH_WEB)
+                if results:
+                    bullets = "\n".join(f"- {item['title']}: {item['snippet']}" for item in results)
+                    reply_parts.append(f"我先帮你整理了搜索结果：\n{bullets}")
+                else:
+                    reply_parts.append("我先帮你查了，但现在还没有拿到可用搜索结果。")
+                continue
+
+            if tool_name == "start_research":
+                query = _clean_tool_text(args.get("query")) or request.message
+                plan = self.research_tool.build_plan(query)
+                tool_results.extend(
+                    [
+                        ToolResult(name="deep_research_plan", ok=True, content=plan),
+                        ToolResult(name="deep_research_job", ok=True, content={"mode": "async", "query": query}),
+                    ]
+                )
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.DEEP_RESEARCH)
+                reply_parts.append(
+                    "我已经开始真正执行这次研究了：会先拆题，再做网页检索、正文阅读和结论汇总。"
+                    "下方研究结果区会持续刷新进度，这里先把研究计划同步给你：\n"
+                    + "\n".join(f"- {item}" for item in plan)
+                )
+                continue
+
+            if tool_name == "answer_file_question":
+                file_ids = _clean_tool_file_ids(args.get("file_ids")) or request.file_ids
+                question = _clean_tool_text(args.get("question")) or request.message
+                file_outcome = await self._handle_file_qa(user_id=user.id, message=question, file_ids=file_ids)
+                tool_results.extend(file_outcome[1])
+                reply_parts.append(file_outcome[0])
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.FILE_QA)
+                continue
+
+            tool_results.append(ToolResult(name=tool_name, ok=False, content={"reason": "unknown_tool"}))
+
+        if not reply_parts:
+            if profile_was_incomplete and not user.needs_profile_completion:
+                reply_parts.append(self.profile_tool.build_saved_reply(user, settings.bot_name, bot_name_updated=bot_name_updated))
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+            elif tool_response.content:
+                reply_parts.append(tool_response.content)
+            else:
+                return await self._handle_interpreted_turn(
+                    request=request,
+                    user=user,
+                    settings=settings,
+                    context_bundle=context_bundle,
+                    tasks=tasks,
+                    profile_was_incomplete=profile_was_incomplete,
+                )
+        elif profile_was_incomplete and not user.needs_profile_completion and not any(
+            "我记住了" in part or "你是" in part for part in reply_parts
+        ):
+            reply_parts.insert(0, self.profile_tool.build_saved_reply(user, settings.bot_name, bot_name_updated=bot_name_updated))
+            primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+
+        return {
+            "intent": primary_intent,
+            "reply": "\n\n".join(part for part in reply_parts if part.strip()),
+            "tool_results": tool_results,
+            "user": user,
+            "settings": settings,
+        }
+
+    async def _handle_interpreted_turn(
+        self,
+        *,
+        request: ChatRequest,
+        user,
+        settings,
+        context_bundle,
+        tasks: list,
+        profile_was_incomplete: bool,
+    ) -> dict[str, Any]:
+        interpretation = await self.intent_interpreter.interpret(
+            message=request.message,
+            user=user,
+            assistant_name=settings.bot_name,
+            recent_lines=context_bundle.recent_lines,
+            tasks=tasks,
+            file_ids=request.file_ids,
+        )
+
+        bot_name_updated = False
+        if interpretation.write_profile and (interpretation.user_name or interpretation.user_email):
+            user = await self.profile_tool.set(
+                user.id,
+                name=interpretation.user_name if interpretation.user_name else None,
+                email=interpretation.user_email if interpretation.user_email else None,
+            )
+        if interpretation.rename_assistant and interpretation.assistant_name:
+            settings = await self.assistant_identity_tool.set(user.id, interpretation.assistant_name)
+            bot_name_updated = True
+
+        intent = interpretation.primary_intent
+        tool_results: list[ToolResult] = []
+
+        should_gate_for_profile = (
+            user.needs_profile_completion
+            and not interpretation.profile_query_field
+            and not interpretation.assistant_query
+            and intent not in {Intent.FILE_QA, Intent.DEEP_RESEARCH}
+        )
+
+        if should_gate_for_profile:
+            reply = self.profile_tool.build_completion_reply(user, settings.bot_name)
+        elif interpretation.profile_query_field:
+            reply = await self.profile_tool.get(user, interpretation.profile_query_field)
+        elif interpretation.assistant_query:
+            reply = f"你现在叫我 {settings.bot_name}。"
+        elif intent == Intent.COLLECT_USER_PROFILE and (interpretation.write_profile or interpretation.rename_assistant):
+            reply = self.profile_tool.build_saved_reply(user, settings.bot_name, bot_name_updated=bot_name_updated)
+        elif interpretation.needs_clarification and interpretation.clarification_prompt:
+            reply = interpretation.clarification_prompt
+        elif intent == Intent.TASK_CRUD:
+            reply, tool_results = await self._handle_task_intent(user.id, interpretation)
+        elif intent == Intent.SEARCH_WEB:
+            results = await self.search_service.search(request.message)
+            tool_results = [ToolResult(name="search_web", ok=True, content=results)]
+            bullets = "\n".join(f"- {item['title']}: {item['snippet']}" for item in results)
+            reply = f"我先帮你整理了搜索结果：\n{bullets}"
+        elif intent == Intent.DEEP_RESEARCH:
+            plan = self.research_tool.build_plan(request.message)
+            tool_results = [
+                ToolResult(name="deep_research_plan", ok=True, content=plan),
+                ToolResult(name="deep_research_job", ok=True, content={"mode": "async"}),
+            ]
+            reply = (
+                "我已经开始真正执行这次研究了：会先拆题，再做网页检索、正文阅读和结论汇总。"
+                "下方研究结果区会持续刷新进度，这里先把研究计划同步给你：\n"
+                + "\n".join(f"- {item}" for item in plan)
+            )
+        elif intent == Intent.FILE_QA:
+            reply, tool_results = await self._handle_file_qa(
+                user_id=user.id,
+                message=request.message,
+                file_ids=request.file_ids,
+            )
+        else:
+            semantic_memories = await self._load_semantic_memories(user.id, request.message)
+            prompt = build_chat_system_prompt(
+                intent,
+                user,
+                assistant_name=settings.bot_name,
+                summary=context_bundle.summary_text,
+                recent_messages=context_bundle.recent_lines,
+                semantic_memories=semantic_memories,
+                skill_instructions=self.skills_loader.render_router_instructions(
+                    message=request.message,
+                    file_ids=request.file_ids,
+                ),
+            )
+            reply = await self.chat_provider.chat(system_prompt=prompt, user_message=request.message)
+            if user.needs_profile_completion and intent != Intent.COLLECT_USER_PROFILE:
+                missing = []
+                if not user.name:
+                    missing.append("名字")
+                if not user.email:
+                    missing.append("邮箱")
+                reply = f"{reply}\n\n顺便告诉我你的{'和'.join(missing)}，我后面就能更准确地记住你。"
+
+        return {
+            "intent": intent,
+            "reply": reply,
+            "tool_results": tool_results,
+            "user": user,
+            "settings": settings,
+        }
+
+    def _build_tool_router_prompt(
+        self,
+        *,
+        user,
+        assistant_name: str,
+        summary: str | None,
+        recent_messages: list[str],
+        tasks: list,
+        message: str,
+        file_ids: list[str],
+    ) -> str:
+        return build_tool_router_prompt(
+            user=user,
+            assistant_name=assistant_name,
+            summary=summary,
+            recent_messages=recent_messages,
+            tasks=tasks,
+            file_ids=file_ids,
+            skill_instructions=self.skills_loader.render_router_instructions(message=message, file_ids=file_ids),
+        )
+
+    def _build_business_tools(self, *, file_ids: list[str]) -> list[ToolDefinition]:
+        return self.tool_registry.build_business_tools(file_ids=file_ids)
+
+    def _order_tool_calls(self, tool_calls: list[ToolCall]) -> list[ToolCall]:
+        return self.tool_registry.order_tool_calls(tool_calls)
+
+    async def _execute_routed_task_call(
+        self,
+        *,
+        user_id: str,
+        message: str,
+        tool_name: str,
+        args: dict[str, Any],
+        current_intent: Intent,
+        user,
+        assistant_name: str,
+    ) -> tuple[str, list[ToolResult], Intent]:
+        if user.needs_profile_completion:
+            return (
+                self.profile_tool.build_completion_reply(user, assistant_name),
+                [ToolResult(name=tool_name, ok=False, content={"reason": "profile_incomplete"})],
+                self._merge_primary_intent(current_intent, Intent.TASK_CRUD),
+            )
+
+        title = _normalize_tool_task_title(args.get("title"))
+        target_ref = _normalize_tool_target_ref(args.get("target_ref"), raw_title=_clean_tool_text(args.get("title")))
+        interpretation = IntentInterpretation(
+            primary_intent=Intent.TASK_CRUD,
+            task_action=TaskToolAction(tool_name),
+            should_execute=True,
+            task_title=title,
+            task_details=_clean_tool_text(args.get("details")),
+            task_priority=_parse_tool_priority(args.get("priority")),
+            task_due_at=_clean_tool_text(args.get("due_at")),
+            task_status=_parse_tool_status(args.get("status")),
+            target_ref=target_ref,
+        )
+        if interpretation.task_action == TaskToolAction.CREATE and not interpretation.task_title:
+            return (
+                "可以，我先帮你建任务。这个任务想叫什么？",
+                [ToolResult(name=tool_name, ok=False, content={"reason": "missing_task_title", "raw_message": message})],
+                self._merge_primary_intent(current_intent, Intent.TASK_CRUD),
+            )
+
+        reply, task_tool_results = await self._handle_task_intent(user_id, interpretation)
+        return reply, task_tool_results, self._merge_primary_intent(current_intent, Intent.TASK_CRUD)
+
+    def _merge_primary_intent(self, current: Intent, incoming: Intent) -> Intent:
+        order = {
+            Intent.GENERAL_CHAT: 0,
+            Intent.COLLECT_USER_PROFILE: 1,
+            Intent.SEARCH_WEB: 2,
+            Intent.TASK_CRUD: 3,
+            Intent.FILE_QA: 4,
+            Intent.DEEP_RESEARCH: 5,
+        }
+        return incoming if order[incoming] >= order[current] else current
+
     async def _handle_file_qa(
         self,
         *,
@@ -152,6 +535,9 @@ class AssistantAgent:
         message: str,
         file_ids: list[str] | None,
     ) -> tuple[str, list[ToolResult]]:
+        if self.rag_tool is not None:
+            outcome = await self.rag_tool.answer(user_id=user_id, message=message, file_ids=file_ids)
+            return outcome.reply, outcome.tool_results
         self._log_file_qa(
             "start",
             user_id=user_id,
@@ -302,104 +688,22 @@ class AssistantAgent:
                 break
         return "\n\n".join(sections).strip()
 
-    async def _handle_task_intent(self, user_id: str, message: str) -> tuple[str, list[ToolResult]]:
-        call = parse_task_tool_call(message)
-        if call.action == TaskToolAction.CREATE:
-            task = await self.repository.create_task(
-                user_id,
-                title=call.title or "未命名任务",
-                details=call.details or "",
-                priority=call.priority,
-                due_at=call.due_at,
-            )
-            details_suffix = f"，需求：{task.details}" if task.details else ""
-            return (
-                f"已创建任务：{task.title}，优先级 {task.priority.value}，状态 {task.status.value}{details_suffix}。",
-                [ToolResult(name=call.action.value, ok=True, content=task.to_dict())],
-            )
-        if call.action == TaskToolAction.UPDATE:
-            task = await self.repository.update_task(
-                user_id,
-                title_hint=call.title or message,
-                details=call.details,
-                status=call.status,
-                priority=call.priority,
-                due_at=call.due_at,
-            )
-            if not task:
-                return (
-                    "我没找到要更新的任务。你可以把任务名放进引号里再试一次。",
-                    [ToolResult(name=call.action.value, ok=False, content=call.to_dict())],
-                )
-            details_suffix = f"，需求：{task.details}" if task.details else ""
-            return (
-                f"任务已更新：{task.title}，状态 {task.status.value}，优先级 {task.priority.value}{details_suffix}。",
-                [ToolResult(name=call.action.value, ok=True, content=task.to_dict())],
-            )
-        if call.action == TaskToolAction.DELETE:
-            deleted = await self.repository.delete_task(user_id, title_hint=call.title)
-            if not deleted:
-                return (
-                    "我没有找到匹配的任务，暂时无法删除。",
-                    [ToolResult(name=call.action.value, ok=False, content=call.to_dict())],
-                )
-            return (
-                f"已删除任务：{call.title or '目标任务'}。",
-                [ToolResult(name=call.action.value, ok=True, content=call.to_dict())],
-            )
-        if call.action == TaskToolAction.GET:
-            task = None
-            if call.task_id:
-                task = await self.repository.get_task(user_id, call.task_id)
-            elif call.title:
-                task = await self.repository.find_task_by_title(user_id, call.title)
-            else:
-                tasks = await self.repository.list_tasks(user_id)
-                if len(tasks) == 1:
-                    task = tasks[0]
-                elif not tasks:
-                    return (
-                        "你现在还没有任务，我可以直接帮你创建一个。",
-                        [ToolResult(name=call.action.value, ok=True, content=[])],
-                    )
-                else:
-                    return (
-                        "我找到多个任务了。你可以说“看看‘任务名’的详情”，我就能把具体需求展开给你。",
-                        [ToolResult(name=call.action.value, ok=False, content={"task_count": len(tasks)})],
-                    )
-
-            if not task:
-                return (
-                    "我没找到这个任务。你可以把任务名放进引号里再试一次。",
-                    [ToolResult(name=call.action.value, ok=False, content=call.to_dict())],
-                )
-            details = task.details or "暂无具体需求"
-            reply = (
-                f"任务详情：{task.title}\n"
-                f"- 状态：{task.status.value}\n"
-                f"- 优先级：{task.priority.value}\n"
-                f"- 截止时间：{task.due_at or '未设置'}\n"
-                f"- 具体需求：{details}"
-            )
-            return (
-                reply,
-                [ToolResult(name=call.action.value, ok=True, content=task.to_dict())],
-            )
-        tasks = await self.repository.list_tasks(user_id)
-        if not tasks:
-            return (
-                "你现在还没有任务，我可以直接帮你创建一个。",
-                [ToolResult(name=call.action.value, ok=True, content=[])],
-            )
-        lines = [
-            f"- {task.title} | status={task.status.value} | priority={task.priority.value} | due={task.due_at or 'n/a'}"
-            + (f" | details={task.details}" if task.details else "")
-            for task in tasks
-        ]
-        return (
-            "当前任务如下：\n" + "\n".join(lines),
-            [ToolResult(name=call.action.value, ok=True, content=[task.to_dict() for task in tasks])],
+    async def _handle_task_intent(
+        self,
+        user_id: str,
+        interpretation: IntentInterpretation,
+    ) -> tuple[str, list[ToolResult]]:
+        outcome = await self.task_tool.execute(
+            user_id,
+            action=interpretation.task_action or TaskToolAction.LIST,
+            task_title=interpretation.task_title,
+            task_details=interpretation.task_details,
+            task_status=interpretation.task_status,
+            task_priority=interpretation.task_priority,
+            task_due_at=interpretation.task_due_at,
+            target_ref=interpretation.target_ref,
         )
+        return outcome.reply, outcome.tool_results
 
     def _build_research_plan(self, message: str) -> list[str]:
         return [
@@ -438,6 +742,62 @@ class AssistantAgent:
         else:
             parts.append(f"后面我会直接称呼你为 {user.name}。")
         return " ".join(parts)
+
+    def _build_profile_recall_reply(self, user, field: str) -> str:
+        if field == "email":
+            if user.email:
+                return f"我记得你的邮箱是 {user.email}。"
+            return "我现在还不知道你的邮箱，你可以直接告诉我。"
+        if field == "profile":
+            known_bits = []
+            if user.name:
+                known_bits.append(f"名字是 {user.name}")
+            if user.email:
+                known_bits.append(f"邮箱是 {user.email}")
+            if known_bits:
+                return "我现在记得你的资料：" + "，".join(known_bits) + "。"
+            return "我现在还没有记住你的资料。你可以先告诉我名字和邮箱。"
+        if user.name:
+            return f"我记得你叫 {user.name}。"
+        return "我现在还不知道你的名字，你可以直接告诉我。"
+
+    async def _resolve_task_reference(
+        self,
+        user_id: str,
+        *,
+        title: str | None,
+        target_ref: str | None,
+    ):
+        tasks = await self.repository.list_tasks(user_id)
+        if title:
+            task = await self.repository.find_task_by_title(user_id, title)
+            if task:
+                return task, None
+            return None, "我没找到这个任务。你可以把任务名放进引号里再试一次。"
+        if not tasks:
+            return None, "你现在还没有任务，我可以直接帮你创建一个。"
+        if target_ref == "recent_task":
+            return self._pick_recent_task(tasks), None
+        if target_ref == "single_task" or len(tasks) == 1:
+            return tasks[0], None
+        return None, "我找到多个任务了。你可以直接告诉我任务名，或者说“删掉刚刚创建的那个任务”。"
+
+    def _pick_recent_task(self, tasks: list):
+        return max(
+            enumerate(tasks),
+            key=lambda item: (
+                getattr(item[1], "updated_at", "") or "",
+                getattr(item[1], "created_at", "") or "",
+                item[0],
+            ),
+        )[1]
+
+    def _personalize_reply(self, reply: str, user_name: str | None, *, intent: Intent) -> str:
+        if not user_name or intent in {Intent.COLLECT_USER_PROFILE, Intent.FILE_QA}:
+            return reply
+        if reply.lstrip().startswith(user_name) or user_name in reply[:80]:
+            return reply
+        return f"{user_name}，{reply}"
 
     async def _load_semantic_memories(self, user_id: str, query: str) -> list[str]:
         if self.memory_service is None:
@@ -504,15 +864,100 @@ class AssistantAgent:
             print(f"[taskmate] file_qa event={event} fields={fields!r}")
 
 
+def _clean_tool_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().strip("\"'“”").strip(" ，。,:：")
+    if not cleaned or cleaned.lower() in {"null", "none", "unknown"}:
+        return None
+    return cleaned
+
+
+def _clean_tool_email(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    matched = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", value)
+    if matched:
+        return matched.group(1)
+    return None
+
+
+def _normalize_profile_field(value: object) -> str:
+    if isinstance(value, str) and value in {"name", "email", "profile"}:
+        return value
+    return "profile"
+
+
+def _clean_tool_file_ids(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    cleaned = [str(item).strip() for item in value if str(item).strip()]
+    return cleaned or None
+
+
+def _parse_tool_priority(value: object) -> TaskPriority | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return TaskPriority(value)
+    except ValueError:
+        return None
+
+
+def _parse_tool_status(value: object) -> TaskStatus | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return TaskStatus(value)
+    except ValueError:
+        return None
+
+
+def _normalize_tool_task_title(value: object) -> str | None:
+    cleaned = _clean_tool_text(value)
+    if not cleaned or len(cleaned) < 2 or is_generic_task_reference(cleaned):
+        return None
+    return cleaned
+
+
+def _normalize_tool_target_ref(value: object, *, raw_title: str | None) -> str | None:
+    if isinstance(value, str) and value in {"recent_task", "single_task", "named_task"}:
+        return value
+    if not raw_title:
+        return None
+    if any(
+        token in raw_title
+        for token in (
+            "刚创建",
+            "刚刚创建",
+            "刚才创建",
+            "最近",
+            "最新",
+            "这个任务",
+            "那个任务",
+            "该任务",
+            "已经创建的任务",
+            "已创建的任务",
+            "创建的任务",
+        )
+    ):
+        return "recent_task"
+    return None
+
+
 def _extract_name(message: str, *, allow_standalone: bool = False) -> str | None:
     patterns = [
         r"我叫([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
         r"我的名字是([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"我的姓名是([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"姓名是([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"你可以叫我([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"叫我([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
     ]
     for pattern in patterns:
         matched = re.search(pattern, message)
         if matched:
-            return matched.group(1).strip()
+            return _normalize_profile_value(matched.group(1))
     if allow_standalone:
         return _extract_standalone_name(message)
     return None
@@ -528,18 +973,30 @@ def _extract_email(message: str) -> str | None:
 def _extract_bot_name(message: str) -> str | None:
     patterns = [
         r"叫你([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"以后叫你([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"以后我叫你([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"以后你就叫([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
         r"你的名字改成([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"把你的名字改成([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"把你的昵称改成([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"你的昵称改成([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
+        r"给你起名叫([A-Za-z\u4e00-\u9fa5·\s]{2,20})",
     ]
     for pattern in patterns:
         matched = re.search(pattern, message)
         if matched:
-            return matched.group(1).strip()
+            return _normalize_profile_value(matched.group(1))
     return None
 
 
 def _extract_standalone_name(message: str) -> str | None:
     candidate = re.sub(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", " ", message)
-    candidate = re.sub(r"(我叫|我的名字是|邮箱是|邮箱|email|叫你|昵称|名字)", " ", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(
+        r"(我叫|我的名字是|我的姓名是|姓名是|邮箱是|邮箱|email|叫你|叫我|你可以叫我|昵称|名字)",
+        " ",
+        candidate,
+        flags=re.IGNORECASE,
+    )
     candidate = re.sub(r"\s+", " ", candidate).strip(" ，。,:：")
     if not candidate:
         return None
@@ -564,8 +1021,14 @@ def _extract_standalone_name(message: str) -> str | None:
     if any(keyword in candidate for keyword in disallowed_keywords):
         return None
     if re.fullmatch(r"[A-Za-z\u4e00-\u9fa5·\s]{2,20}", candidate):
-        return candidate.strip()
+        return _normalize_profile_value(candidate)
     return None
+
+
+def _normalize_profile_value(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", value).strip(" ，。,:：")
+    normalized = re.sub(r"(吧|呀|啦|哦)$", "", normalized).strip(" ，。,:：")
+    return normalized
 
 
 def _infer_document_qa_mode(message: str) -> str:

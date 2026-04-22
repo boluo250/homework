@@ -282,6 +282,72 @@ def test_demo_e2e_research_submit_and_poll(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_demo_e2e_new_session_keeps_profile_but_rotates_conversation(tmp_path: Path) -> None:
+    async def run() -> None:
+        container = build_demo_container(tmp_path)
+        client_id = "demo-session-client"
+
+        first = await chat(container, client_id, "我叫小周，我的邮箱是 zhou@example.com，叫你阿周")
+        first_conversation_id = first["conversation_id"]
+        assert first["user_profile"]["name"] == "小周"
+        assert first["assistant_name"] == "阿周"
+
+        second = await chat(container, client_id, "列出我的任务")
+        second_conversation_id = second["conversation_id"]
+        assert second_conversation_id != first_conversation_id
+        assert "名字和邮箱" not in second["reply"]
+
+        session_meta = await request_json(container, "GET", f"/api/chat?client_id={client_id}")
+        assert session_meta["user_profile"]["name"] == "小周"
+        assert session_meta["user_profile"]["email"] == "zhou@example.com"
+        assert session_meta["assistant_name"] == "阿周"
+
+    asyncio.run(run())
+
+
+def test_demo_e2e_admin_reset_clears_workspace_data(tmp_path: Path) -> None:
+    async def run() -> None:
+        container = build_demo_container(tmp_path)
+        client_id = "demo-reset-client"
+
+        profile = await chat(container, client_id, "我叫小陈，我的邮箱是 chen@example.com")
+        await chat(
+            container,
+            client_id,
+            '帮我创建一个"清空测试"任务，要求验证 reset 接口',
+            conversation_id=profile["conversation_id"],
+        )
+        await request_json(
+            container,
+            "POST",
+            "/api/files",
+            {
+                "client_id": client_id,
+                "filename": "reset-note.md",
+                "content_type": "text/markdown",
+                "content_base64": base64.b64encode("# reset\n验证清空能力".encode("utf-8")).decode("utf-8"),
+            },
+        )
+
+        reset_payload = await request_json(
+            container,
+            "POST",
+            "/api/admin/reset",
+            {"confirm": "RESET_ALL_DATA"},
+        )
+        assert reset_payload["ok"] is True
+
+        tasks = await request_json(container, "GET", f"/api/tasks?client_id={client_id}")
+        files = await request_json(container, "GET", f"/api/files?client_id={client_id}")
+        session_meta = await request_json(container, "GET", f"/api/chat?client_id={client_id}")
+        assert tasks["tasks"] == []
+        assert files["files"] == []
+        assert session_meta["user_profile"]["name"] in {None, ""}
+        assert session_meta["user_profile"]["email"] in {None, ""}
+
+    asyncio.run(run())
+
+
 def build_demo_container(tmp_path: Path) -> DemoContainer:
     repository = InMemoryAppRepository()
     qdrant_store = QdrantStore(storage_path=tmp_path / "vectors.json")

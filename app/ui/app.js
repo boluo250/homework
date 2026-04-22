@@ -2,6 +2,8 @@ const storageKeys = {
   clientId: "taskmate-client-id",
   conversationId: "taskmate-conversation-id",
   assistantName: "taskmate-assistant-name",
+  userName: "taskmate-user-name",
+  userEmail: "taskmate-user-email",
 };
 
 const RESEARCH_POLL_INTERVAL_MS = 2000;
@@ -12,6 +14,7 @@ const state = {
   clientId: loadOrCreateClientId(),
   conversationId: localStorage.getItem(storageKeys.conversationId) || "",
   assistantName: localStorage.getItem(storageKeys.assistantName) || "TaskMate",
+  userProfile: loadUserProfile(),
   selectedFileIds: new Set(),
   activeFileId: "",
   researchJobId: "",
@@ -106,6 +109,9 @@ async function submitChat() {
     if (payload.assistant_name) {
       applyAssistantIdentity(payload.assistant_name);
     }
+    if (payload.user_profile) {
+      applyUserProfile(payload.user_profile);
+    }
     updateMessage(pendingMessageId, payload.reply);
 
     await refreshTasks(payload.user_profile?.id);
@@ -170,6 +176,8 @@ dom.resetDataButton.addEventListener("click", async () => {
     state.conversationId = "";
     state.researchJobId = "";
     localStorage.removeItem(storageKeys.conversationId);
+    applyAssistantIdentity("TaskMate");
+    applyUserProfile(null);
     dom.messageList.innerHTML = "";
     appendMessage("assistant", "数据已经清空。现在可以重新上传文件并从干净状态开始测试。");
     renderResearchState({ status: "idle", report_markdown: "等待研究模式返回结果..." });
@@ -518,7 +526,7 @@ function appendMessage(role, content, options = {}) {
   const node = dom.messageTemplate.content.firstElementChild.cloneNode(true);
   node.dataset.role = role;
   node.dataset.messageId = options.messageId || `msg_${crypto.randomUUID().slice(0, 8)}`;
-  node.querySelector(".message-meta").textContent = role === "user" ? "你" : state.assistantName;
+  node.querySelector(".message-meta").textContent = role === "user" ? (state.userProfile?.name || "你") : state.assistantName;
   setMessageContent(node, content, options);
   dom.messageList.appendChild(node);
   dom.messageList.scrollTop = dom.messageList.scrollHeight;
@@ -568,19 +576,66 @@ function loadOrCreateClientId() {
   return next;
 }
 
+function loadUserProfile() {
+  const name = localStorage.getItem(storageKeys.userName) || "";
+  const email = localStorage.getItem(storageKeys.userEmail) || "";
+  if (!name && !email) {
+    return null;
+  }
+  return { name, email };
+}
+
+function syncComposerPlaceholder() {
+  if (!dom.messageInput) {
+    return;
+  }
+  const missing = missingProfileFields(state.userProfile);
+  if (missing.length > 0) {
+    dom.messageInput.placeholder = `先告诉我你的${missing.join("和")}，例如：我叫小李，邮箱是 xiaoli@example.com`;
+    return;
+  }
+  dom.messageInput.placeholder = `${state.userProfile.name}，试试：帮我创建一个“简历优化”任务，下周五前完成，高优先级`;
+}
+
+function buildBootstrapMessage() {
+  const missing = missingProfileFields(state.userProfile);
+  if (missing.length > 0) {
+    return `你好，我是 ${state.assistantName}。开始之前，先告诉我你的${missing.join("和")}，我会先记下来，后续就能稳定称呼你。`;
+  }
+  return `你好，${state.userProfile.name}，我是 ${state.assistantName}。你的名字和邮箱我已经记住了，可以继续创建任务、上传文件，或者直接发起研究。`;
+}
+
+function missingProfileFields(profile) {
+  const missing = [];
+  if (!profile?.name) {
+    missing.push("名字");
+  }
+  if (!profile?.email) {
+    missing.push("邮箱");
+  }
+  return missing;
+}
+
+function refreshMessageMetaLabels() {
+  dom.messageList.querySelectorAll(".message").forEach((node) => {
+    const meta = node.querySelector(".message-meta");
+    if (!meta) {
+      return;
+    }
+    meta.textContent = node.dataset.role === "user" ? (state.userProfile?.name || "你") : state.assistantName;
+  });
+}
+
 async function initializeWorkspace() {
-  appendMessage("assistant", `你好，我是 ${state.assistantName}，我已经准备好接住任务、研究请求和文件问答了。`);
-  appendMessage(
-    "assistant",
-    "首次使用建议：先告诉我你的名字和邮箱，再试试创建一个带具体要求的任务、上传一份文件，或者发起一个研究主题。",
-  );
-  await refreshSessionMeta();
+  syncComposerPlaceholder();
+  refreshMessageMetaLabels();
+  await refreshSessionMeta({ bootstrap: true });
   await refreshTasks();
   await refreshFiles();
   renderSelectedFilesHint();
 }
 
-async function refreshSessionMeta() {
+async function refreshSessionMeta(options = {}) {
   try {
     const response = await fetch(`/api/chat?client_id=${encodeURIComponent(state.clientId)}`);
     const payload = await response.json();
@@ -590,11 +645,17 @@ async function refreshSessionMeta() {
     if (payload.assistant_name) {
       applyAssistantIdentity(payload.assistant_name);
     }
-    if (!payload.user_profile?.name || !payload.user_profile?.email) {
-      appendMessage("assistant", "开始之前，先把你的名字和邮箱告诉我，我会在后续对话里持续记住。");
+    applyUserProfile(payload.user_profile || null);
+    if (options.bootstrap) {
+      appendMessage("assistant", buildBootstrapMessage());
     }
+    return payload;
   } catch (_error) {
     // Keep the optimistic local identity if session bootstrap fails.
+    if (options.bootstrap) {
+      appendMessage("assistant", buildBootstrapMessage());
+    }
+    return null;
   }
 }
 
@@ -605,6 +666,23 @@ function applyAssistantIdentity(name) {
   if (dom.assistantBrand) {
     dom.assistantBrand.textContent = state.assistantName;
   }
+  refreshMessageMetaLabels();
+}
+
+function applyUserProfile(profile) {
+  state.userProfile = profile && (profile.name || profile.email) ? profile : null;
+  if (state.userProfile?.name) {
+    localStorage.setItem(storageKeys.userName, state.userProfile.name);
+  } else {
+    localStorage.removeItem(storageKeys.userName);
+  }
+  if (state.userProfile?.email) {
+    localStorage.setItem(storageKeys.userEmail, state.userProfile.email);
+  } else {
+    localStorage.removeItem(storageKeys.userEmail);
+  }
+  syncComposerPlaceholder();
+  refreshMessageMetaLabels();
 }
 
 function setComposerBusy(isBusy) {

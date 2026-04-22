@@ -16,6 +16,7 @@ from app.services.search_service import SearchService
 
 class FakeChatProvider(ChatProviderBase):
     def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
         self.system_prompt = ""
         self.user_message = ""
 
@@ -25,8 +26,34 @@ class FakeChatProvider(ChatProviderBase):
         system_prompt: str,
         user_message: str,
     ) -> str:
+        self.calls.append((system_prompt, user_message))
         self.system_prompt = system_prompt
         self.user_message = user_message
+        if "strict intent interpreter" in system_prompt:
+            return """
+            {
+              "primary_intent": "file_qa",
+              "task_action": null,
+              "should_execute": true,
+              "needs_clarification": false,
+              "clarification_prompt": null,
+              "confidence": 0.98,
+              "target_ref": null,
+              "task_title": null,
+              "task_details": null,
+              "task_priority": null,
+              "task_due_at": null,
+              "task_status": null,
+              "user_name": null,
+              "user_email": null,
+              "assistant_name": null,
+              "write_profile": false,
+              "rename_assistant": false,
+              "profile_query_field": null,
+              "assistant_query": false,
+              "explanation": "selected file question"
+            }
+            """
         return "这是一段归纳后的回答。"
 
 
@@ -70,7 +97,8 @@ def test_file_qa_uses_llm_to_summarize_retrieved_context(tmp_path) -> None:
                 file_ids=[uploaded["file"]["id"]],
             )
         )
-        assert response.reply == "这是一段归纳后的回答。"
+        assert response.reply.startswith("这是一段归纳后的回答。")
+        assert "参考来源" in response.reply
         assert "Retrieved evidence" in chat_provider.system_prompt
         assert "Full document context" in chat_provider.system_prompt
         assert "不要只摘抄原文" in chat_provider.user_message

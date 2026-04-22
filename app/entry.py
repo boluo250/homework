@@ -15,7 +15,6 @@ if __package__ in {None, ""} and "app" not in sys.modules:
     package.__path__ = [str(Path(__file__).resolve().parent)]
     sys.modules["app"] = package
 
-from app.core.agent import AssistantAgent
 from app.core.http import HttpRequest, HttpResponse
 from app.providers.embedding_remote import RemoteEmbeddingProvider
 from app.providers.openrouter_chat import OpenRouterChatProvider
@@ -24,6 +23,8 @@ from app.routes.chat import handle_chat
 from app.routes.files import handle_files
 from app.routes.research import handle_research
 from app.routes.tasks import handle_tasks
+from app.runtime.agent_loop import AgentLoop
+from app.services.embedding_service import EmbeddingService
 from app.services.cloudflare_d1_repo import CloudflareD1Repository
 from app.services.cloudflare_r2_store import CloudflareR2FileStore
 from app.services.d1_repo import SQLiteAppRepository
@@ -31,6 +32,7 @@ from app.services.file_parser import FileParser
 from app.services.file_service import FileService
 from app.services.memory_service import MemoryService
 from app.services.mistral_document_parse import MistralDocumentParseService
+from app.services.openrouter_client import OpenRouterClient
 from app.services.qdrant_store import QdrantStore
 from app.services.r2_store import R2FileStore
 from app.services.rag_service import RagService
@@ -38,6 +40,18 @@ from app.services.research_service import ResearchService
 from app.services.search_service import SearchService
 from app.services.schema_sql import SCHEMA_SQL
 from app.services.web_fetch_service import WebFetchService
+from app.state.assistant_state import AssistantState
+from app.state.conversation_state import ConversationState
+from app.state.file_state import FileState
+from app.state.research_state import ResearchState
+from app.state.task_state import TaskState
+from app.state.user_state import UserState
+from app.tools.assistant_identity_tool import AssistantIdentityTool
+from app.tools.profile_tool import ProfileTool
+from app.tools.rag_tool import RagTool
+from app.tools.research_tool import ResearchTool
+from app.tools.task_tool import TaskTool
+from app.tools.workspace_admin_tool import WorkspaceAdminTool
 from app.ui_assets import UI_ASSETS
 
 try:
@@ -77,11 +91,13 @@ class AppContainer:
             model=getattr(env, "EMBEDDING_MODEL", "text-embedding-3-small"),
             endpoint_url=getattr(env, "EMBEDDING_API_URL", None),
         )
+        self.embedding_service = EmbeddingService(embedding_provider)
         chat_provider = OpenRouterChatProvider(
             api_key=getattr(env, "OPENROUTER_API_KEY", None),
             model=getattr(env, "OPENROUTER_MODEL", "openrouter/auto"),
             app_name=getattr(env, "APP_NAME", "TaskMate"),
         )
+        self.openrouter_client = OpenRouterClient(chat_provider)
         search_service = SearchService(api_key=getattr(env, "SERPER_API_KEY", None))
         qdrant_remote_url = _resolve_qdrant_remote_url(getattr(env, "QDRANT_URL", None))
         qdrant_store = QdrantStore(
@@ -106,6 +122,12 @@ class AppContainer:
             else R2FileStore(DATA_DIR / "r2", bucket_name=getattr(env, "R2_BUCKET_NAME", None))
         )
         self.repository = repository
+        self.user_state = UserState(repository)
+        self.assistant_state = AssistantState(repository)
+        self.task_state = TaskState(repository)
+        self.file_state = FileState(repository)
+        self.research_state = ResearchState(repository)
+        self.conversation_state = ConversationState(repository)
         self.file_service = FileService(
             repository=repository,
             file_store=file_store,
@@ -124,12 +146,36 @@ class AppContainer:
             chat_provider=chat_provider,
             queue_binding=getattr(env, "RESEARCH_QUEUE", None),
         )
-        self.agent = AssistantAgent(
+        self.profile_tool = ProfileTool(self.user_state)
+        self.assistant_identity_tool = AssistantIdentityTool(self.assistant_state)
+        self.task_tool = TaskTool(self.task_state)
+        self.rag_tool = RagTool(
+            file_state=self.file_state,
+            file_service=self.file_service,
+            rag_service=rag_service,
+            chat_provider=chat_provider,
+        )
+        self.research_tool = ResearchTool(self.research_state, self.research_service)
+        self.workspace_admin_tool = WorkspaceAdminTool(
+            repository=repository,
+            file_store=file_store,
+            qdrant_store=qdrant_store,
+            task_state=self.task_state,
+            file_state=self.file_state,
+            research_state=self.research_state,
+            user_state=self.user_state,
+        )
+        self.agent = AgentLoop(
             repository=repository,
             chat_provider=chat_provider,
             search_service=search_service,
             rag_service=rag_service,
             memory_service=memory_service,
+            profile_tool=self.profile_tool,
+            assistant_identity_tool=self.assistant_identity_tool,
+            task_tool=self.task_tool,
+            rag_tool=self.rag_tool,
+            research_tool=self.research_tool,
         )
 
 
@@ -193,11 +239,31 @@ async def route_request(request: HttpRequest, container: AppContainer) -> HttpRe
     if request.path == "/api/chat":
         return _with_cors(await handle_chat(request, container.agent))
     if request.path == "/api/tasks":
-        return _with_cors(await handle_tasks(request, container.repository))
+        return _with_cors(
+            await handle_tasks(
+                request,
+                container.repository,
+                task_state=getattr(container, "task_state", None),
+            )
+        )
     if request.path == "/api/files":
-        return _with_cors(await handle_files(request, container.repository, container.file_service))
+        return _with_cors(
+            await handle_files(
+                request,
+                container.repository,
+                container.file_service,
+                file_state=getattr(container, "file_state", None),
+                rag_tool=getattr(container, "rag_tool", None),
+            )
+        )
     if request.path == "/api/research":
-        return _with_cors(await handle_research(request, container.research_service))
+        return _with_cors(
+            await handle_research(
+                request,
+                container.research_service,
+                research_tool=getattr(container, "research_tool", None),
+            )
+        )
     if request.path == "/api/debug/research":
         job_id = request.query.get("job_id", "").strip()
         if not job_id:
@@ -215,6 +281,7 @@ async def route_request(request: HttpRequest, container: AppContainer) -> HttpRe
                 container.repository,
                 container.file_service.file_store,
                 container.file_service.qdrant_store,
+                workspace_admin_tool=getattr(container, "workspace_admin_tool", None),
             )
         )
     return _with_cors(HttpResponse.json({"error": "Not found"}, status=404))

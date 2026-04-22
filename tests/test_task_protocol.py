@@ -22,3 +22,9 @@ def test_get_task_protocol_extracts_title_for_detail_query() -> None:
     call = parse_task_tool_call('看看"简历优化"任务的具体需求')
     assert call.action == TaskToolAction.GET
     assert call.title == "简历优化"
+
+
+def test_create_task_protocol_does_not_treat_generic_quantifier_as_title() -> None:
+    call = parse_task_tool_call("帮我创建个任务")
+    assert call.action == TaskToolAction.CREATE
+    assert call.title is None
