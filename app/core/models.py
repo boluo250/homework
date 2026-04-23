@@ -158,6 +158,47 @@ class ResearchJobState:
 
 
 @dataclass(slots=True)
+class ResearchSubRun:
+    id: str
+    job_id: str
+    title: str
+    objective: str
+    profile: str
+    strategy_id: str
+    status: str = "queued"
+    step_index: int = 0
+    search_queries_json: str | None = None
+    summary: str | None = None
+    artifacts_json: str | None = None
+    last_error: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["search_queries"] = _safe_json_loads(self.search_queries_json, default=[])
+        payload["artifacts"] = _safe_json_loads(self.artifacts_json, default={})
+        return payload
+
+
+@dataclass(slots=True)
+class ResearchEvent:
+    id: str
+    job_id: str
+    event_type: str
+    payload_json: str
+    sub_run_id: str | None = None
+    created_at: str = field(default_factory=utc_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["payload"] = _safe_json_loads(self.payload_json, default={})
+        return payload
+
+
+@dataclass(slots=True)
 class ToolResult:
     name: str
     ok: bool
@@ -197,3 +238,12 @@ class ChatResponse:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
+
+
+def _safe_json_loads(value: str | None, *, default: Any) -> Any:
+    if not value:
+        return default
+    try:
+        return __import__("json").loads(value)
+    except Exception:  # noqa: BLE001
+        return default

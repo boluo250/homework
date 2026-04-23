@@ -723,9 +723,11 @@ function renderResearchState(payload = {}) {
   const status = payload.status || phase || "idle";
   const currentStep = Number(payload.current_step ?? payload.state?.current_step ?? 0);
   const totalSteps = Number(payload.total_steps ?? payload.state?.total_steps ?? 0);
+  const profileLabel = payload.research_profile_label || "通用研究";
+  const subRuns = Array.isArray(payload.sub_runs) ? payload.sub_runs : [];
   const percent = researchProgressPercent({ status, phase, currentStep, totalSteps });
   const title = researchProgressTitle({ status, phase, currentStep, totalSteps });
-  const meta = researchProgressMeta({ status, phase, currentStep, totalSteps, percent });
+  const meta = researchProgressMeta({ status, phase, currentStep, totalSteps, percent, profileLabel, subRuns });
   const reportText = payload.report_markdown || (status === "idle" ? "等待研究模式返回结果..." : dom.reportBox.textContent);
 
   setResearchStatus(phase);
@@ -769,12 +771,19 @@ function researchProgressTitle({ status, phase, currentStep, totalSteps }) {
   return "等待新的研究任务";
 }
 
-function researchProgressMeta({ status, phase, currentStep, totalSteps, percent }) {
+function researchProgressMeta({ status, phase, currentStep, totalSteps, percent, profileLabel, subRuns }) {
   if (status === "idle") return "尚未开始";
+  const runSummary = subRuns.length > 0
+    ? `子代理 ${subRuns.filter((item) => item.status === "completed").length}/${subRuns.length}`
+    : null;
   if (totalSteps > 0) {
-    return `${researchStatusLabel(phase)} · ${currentStep}/${totalSteps} · ${percent}%`;
+    return [profileLabel, researchStatusLabel(phase), `${currentStep}/${totalSteps}`, runSummary, `${percent}%`]
+      .filter(Boolean)
+      .join(" · ");
   }
-  return `${researchStatusLabel(phase)} · ${percent}%`;
+  return [profileLabel, researchStatusLabel(phase), runSummary, `${percent}%`]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 function researchStatusLabel(status) {
@@ -783,6 +792,7 @@ function researchStatusLabel(status) {
     queued: "排队中",
     pending: "已提交",
     planning: "规划中",
+    orchestrating: "编排中",
     searching: "检索中",
     reading: "阅读中",
     synthesizing: "汇总中",
@@ -800,6 +810,7 @@ function researchThinkingLabel(status) {
     queued: "正在等待后台消费者接手",
     pending: "正在接住研究任务",
     planning: "正在拆解研究问题",
+    orchestrating: "正在编排子代理",
     searching: "正在搜索网页资料",
     reading: "正在阅读和整理证据",
     synthesizing: "正在汇总结论与建议",

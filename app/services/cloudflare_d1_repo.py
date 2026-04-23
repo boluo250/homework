@@ -9,8 +9,10 @@ from app.core.models import (
     ConversationSummary,
     FileRecord,
     MessageRole,
+    ResearchEvent,
     ResearchJob,
     ResearchJobState,
+    ResearchSubRun,
     TaskPriority,
     TaskRecord,
     TaskStatus,
@@ -576,6 +578,160 @@ class CloudflareD1Repository(AppRepository):
         row = await self._first("SELECT * FROM research_job_states WHERE job_id = ?", (job_id,))
         return _row_to_research_job_state(row) if row else None
 
+    async def create_research_sub_run(
+        self,
+        job_id: str,
+        *,
+        title: str,
+        objective: str,
+        profile: str,
+        strategy_id: str,
+        step_index: int,
+        search_queries_json: str | None = None,
+    ) -> ResearchSubRun:
+        await self._ensure_schema()
+        payload = ResearchSubRun(
+            id=new_id("rsub"),
+            job_id=job_id,
+            title=title,
+            objective=objective,
+            profile=profile,
+            strategy_id=strategy_id,
+            step_index=step_index,
+            search_queries_json=search_queries_json,
+        )
+        await self._run(
+            """
+            INSERT INTO research_sub_runs
+            (id, job_id, title, objective, profile, strategy_id, status, step_index, search_queries_json, summary, artifacts_json, last_error, started_at, completed_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.id,
+                payload.job_id,
+                payload.title,
+                payload.objective,
+                payload.profile,
+                payload.strategy_id,
+                payload.status,
+                payload.step_index,
+                payload.search_queries_json,
+                payload.summary,
+                payload.artifacts_json,
+                payload.last_error,
+                payload.started_at,
+                payload.completed_at,
+                payload.created_at,
+                payload.updated_at,
+            ),
+        )
+        return payload
+
+    async def update_research_sub_run(
+        self,
+        sub_run_id: str,
+        *,
+        status: str | None = None,
+        summary: str | None = None,
+        artifacts_json: str | None = None,
+        last_error: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> ResearchSubRun | None:
+        current = await self.get_research_sub_run(sub_run_id)
+        if not current:
+            return None
+        updated_at = utc_now_iso()
+        next_payload = ResearchSubRun(
+            id=current.id,
+            job_id=current.job_id,
+            title=current.title,
+            objective=current.objective,
+            profile=current.profile,
+            strategy_id=current.strategy_id,
+            status=current.status if status is None else status,
+            step_index=current.step_index,
+            search_queries_json=current.search_queries_json,
+            summary=current.summary if summary is None else summary,
+            artifacts_json=current.artifacts_json if artifacts_json is None else artifacts_json,
+            last_error=current.last_error if last_error is None else last_error,
+            started_at=current.started_at if started_at is None else started_at,
+            completed_at=current.completed_at if completed_at is None else completed_at,
+            created_at=current.created_at,
+            updated_at=updated_at,
+        )
+        await self._run(
+            """
+            UPDATE research_sub_runs
+            SET status = ?, summary = ?, artifacts_json = ?, last_error = ?, started_at = ?, completed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                next_payload.status,
+                next_payload.summary,
+                next_payload.artifacts_json,
+                next_payload.last_error,
+                next_payload.started_at,
+                next_payload.completed_at,
+                updated_at,
+                sub_run_id,
+            ),
+        )
+        return next_payload
+
+    async def get_research_sub_run(self, sub_run_id: str) -> ResearchSubRun | None:
+        await self._ensure_schema()
+        row = await self._first("SELECT * FROM research_sub_runs WHERE id = ?", (sub_run_id,))
+        return _row_to_research_sub_run(row) if row else None
+
+    async def list_research_sub_runs(self, job_id: str) -> list[ResearchSubRun]:
+        await self._ensure_schema()
+        rows = await self._all(
+            "SELECT * FROM research_sub_runs WHERE job_id = ? ORDER BY step_index ASC, created_at ASC",
+            (job_id,),
+        )
+        return [_row_to_research_sub_run(row) for row in rows]
+
+    async def append_research_event(
+        self,
+        job_id: str,
+        *,
+        event_type: str,
+        payload_json: str,
+        sub_run_id: str | None = None,
+    ) -> ResearchEvent:
+        await self._ensure_schema()
+        payload = ResearchEvent(
+            id=new_id("revent"),
+            job_id=job_id,
+            sub_run_id=sub_run_id,
+            event_type=event_type,
+            payload_json=payload_json,
+        )
+        await self._run(
+            """
+            INSERT INTO research_events (id, job_id, sub_run_id, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.id,
+                payload.job_id,
+                payload.sub_run_id,
+                payload.event_type,
+                payload.payload_json,
+                payload.created_at,
+            ),
+        )
+        return payload
+
+    async def list_research_events(self, job_id: str) -> list[ResearchEvent]:
+        await self._ensure_schema()
+        rows = await self._all(
+            "SELECT * FROM research_events WHERE job_id = ? ORDER BY created_at ASC",
+            (job_id,),
+        )
+        return [_row_to_research_event(row) for row in rows]
+
     async def reset_all_data(self) -> None:
         await self._ensure_schema()
         for table in (
@@ -585,8 +741,10 @@ class CloudflareD1Repository(AppRepository):
             "assistant_settings",
             "tasks",
             "files",
-            "research_jobs",
             "research_job_states",
+            "research_events",
+            "research_sub_runs",
+            "research_jobs",
             "users",
         ):
             await self._run(f"DELETE FROM {table}")
@@ -756,4 +914,36 @@ def _row_to_research_job_state(row: dict[str, Any]) -> ResearchJobState:
         started_at=row.get("started_at"),
         completed_at=row.get("completed_at"),
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_research_sub_run(row: dict[str, Any]) -> ResearchSubRun:
+    return ResearchSubRun(
+        id=row["id"],
+        job_id=row["job_id"],
+        title=row["title"],
+        objective=row["objective"],
+        profile=row["profile"],
+        strategy_id=row["strategy_id"],
+        status=row["status"],
+        step_index=int(row["step_index"]),
+        search_queries_json=row.get("search_queries_json"),
+        summary=row.get("summary"),
+        artifacts_json=row.get("artifacts_json"),
+        last_error=row.get("last_error"),
+        started_at=row.get("started_at"),
+        completed_at=row.get("completed_at"),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_research_event(row: dict[str, Any]) -> ResearchEvent:
+    return ResearchEvent(
+        id=row["id"],
+        job_id=row["job_id"],
+        sub_run_id=row.get("sub_run_id"),
+        event_type=row["event_type"],
+        payload_json=row["payload_json"],
+        created_at=row["created_at"],
     )

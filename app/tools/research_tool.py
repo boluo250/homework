@@ -11,6 +11,12 @@ class ResearchTool:
         self.research_service = research_service
 
     def build_plan(self, message: str) -> list[str]:
+        if self.research_service is not None:
+            plan = self.research_service.agent.build_research_plan(message)
+            return [
+                f"[{plan.profile_label}] {step.title}：{step.objective}"
+                for step in plan.steps
+            ]
         return [
             f"明确研究目标：{message}",
             "拆分 3 到 5 个子问题并定义各自的证据来源",

@@ -12,8 +12,10 @@ from app.core.models import (
     ConversationSummary,
     FileRecord,
     MessageRole,
+    ResearchEvent,
     ResearchJob,
     ResearchJobState,
+    ResearchSubRun,
     TaskPriority,
     TaskRecord,
     TaskStatus,
@@ -219,6 +221,57 @@ class AppRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def create_research_sub_run(
+        self,
+        job_id: str,
+        *,
+        title: str,
+        objective: str,
+        profile: str,
+        strategy_id: str,
+        step_index: int,
+        search_queries_json: str | None = None,
+    ) -> ResearchSubRun:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def update_research_sub_run(
+        self,
+        sub_run_id: str,
+        *,
+        status: str | None = None,
+        summary: str | None = None,
+        artifacts_json: str | None = None,
+        last_error: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> ResearchSubRun | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_research_sub_run(self, sub_run_id: str) -> ResearchSubRun | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_research_sub_runs(self, job_id: str) -> list[ResearchSubRun]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def append_research_event(
+        self,
+        job_id: str,
+        *,
+        event_type: str,
+        payload_json: str,
+        sub_run_id: str | None = None,
+    ) -> ResearchEvent:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_research_events(self, job_id: str) -> list[ResearchEvent]:
+        raise NotImplementedError
+
+    @abstractmethod
     async def reset_all_data(self) -> None:
         raise NotImplementedError
 
@@ -234,6 +287,9 @@ class InMemoryAppRepository(AppRepository):
         self.files_by_user_id: dict[str, list[FileRecord]] = {}
         self.research_jobs_by_id: dict[str, ResearchJob] = {}
         self.research_job_states_by_id: dict[str, ResearchJobState] = {}
+        self.research_sub_runs_by_id: dict[str, ResearchSubRun] = {}
+        self.research_sub_runs_by_job_id: dict[str, list[ResearchSubRun]] = {}
+        self.research_events_by_job_id: dict[str, list[ResearchEvent]] = {}
 
     async def get_or_create_user(self, client_id: str) -> UserProfile:
         user = self.users_by_client_id.get(client_id)
@@ -556,6 +612,88 @@ class InMemoryAppRepository(AppRepository):
     async def get_research_job_state(self, job_id: str) -> ResearchJobState | None:
         return self.research_job_states_by_id.get(job_id)
 
+    async def create_research_sub_run(
+        self,
+        job_id: str,
+        *,
+        title: str,
+        objective: str,
+        profile: str,
+        strategy_id: str,
+        step_index: int,
+        search_queries_json: str | None = None,
+    ) -> ResearchSubRun:
+        payload = ResearchSubRun(
+            id=new_id("rsub"),
+            job_id=job_id,
+            title=title,
+            objective=objective,
+            profile=profile,
+            strategy_id=strategy_id,
+            step_index=step_index,
+            search_queries_json=search_queries_json,
+        )
+        self.research_sub_runs_by_id[payload.id] = payload
+        self.research_sub_runs_by_job_id.setdefault(job_id, []).append(payload)
+        self.research_sub_runs_by_job_id[job_id].sort(key=lambda item: (item.step_index, item.created_at))
+        return payload
+
+    async def update_research_sub_run(
+        self,
+        sub_run_id: str,
+        *,
+        status: str | None = None,
+        summary: str | None = None,
+        artifacts_json: str | None = None,
+        last_error: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> ResearchSubRun | None:
+        payload = self.research_sub_runs_by_id.get(sub_run_id)
+        if not payload:
+            return None
+        if status is not None:
+            payload.status = status
+        if summary is not None:
+            payload.summary = summary
+        if artifacts_json is not None:
+            payload.artifacts_json = artifacts_json
+        if last_error is not None:
+            payload.last_error = last_error
+        if started_at is not None:
+            payload.started_at = started_at
+        if completed_at is not None:
+            payload.completed_at = completed_at
+        payload.updated_at = utc_now_iso()
+        return payload
+
+    async def get_research_sub_run(self, sub_run_id: str) -> ResearchSubRun | None:
+        return self.research_sub_runs_by_id.get(sub_run_id)
+
+    async def list_research_sub_runs(self, job_id: str) -> list[ResearchSubRun]:
+        return list(self.research_sub_runs_by_job_id.get(job_id, []))
+
+    async def append_research_event(
+        self,
+        job_id: str,
+        *,
+        event_type: str,
+        payload_json: str,
+        sub_run_id: str | None = None,
+    ) -> ResearchEvent:
+        event = ResearchEvent(
+            id=new_id("revent"),
+            job_id=job_id,
+            sub_run_id=sub_run_id,
+            event_type=event_type,
+            payload_json=payload_json,
+        )
+        self.research_events_by_job_id.setdefault(job_id, []).append(event)
+        return event
+
+    async def list_research_events(self, job_id: str) -> list[ResearchEvent]:
+        return list(self.research_events_by_job_id.get(job_id, []))
+
     async def reset_all_data(self) -> None:
         self.users_by_client_id.clear()
         self.assistant_settings_by_user_id.clear()
@@ -566,6 +704,9 @@ class InMemoryAppRepository(AppRepository):
         self.files_by_user_id.clear()
         self.research_jobs_by_id.clear()
         self.research_job_states_by_id.clear()
+        self.research_sub_runs_by_id.clear()
+        self.research_sub_runs_by_job_id.clear()
+        self.research_events_by_job_id.clear()
 
 
 class SQLiteAppRepository(AppRepository):
@@ -1117,6 +1258,155 @@ class SQLiteAppRepository(AppRepository):
         row = self._fetchone("SELECT * FROM research_job_states WHERE job_id = ?", (job_id,))
         return _row_to_research_job_state(row) if row else None
 
+    async def create_research_sub_run(
+        self,
+        job_id: str,
+        *,
+        title: str,
+        objective: str,
+        profile: str,
+        strategy_id: str,
+        step_index: int,
+        search_queries_json: str | None = None,
+    ) -> ResearchSubRun:
+        payload = ResearchSubRun(
+            id=new_id("rsub"),
+            job_id=job_id,
+            title=title,
+            objective=objective,
+            profile=profile,
+            strategy_id=strategy_id,
+            step_index=step_index,
+            search_queries_json=search_queries_json,
+        )
+        self._execute(
+            """
+            INSERT INTO research_sub_runs
+            (id, job_id, title, objective, profile, strategy_id, status, step_index, search_queries_json, summary, artifacts_json, last_error, started_at, completed_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.id,
+                payload.job_id,
+                payload.title,
+                payload.objective,
+                payload.profile,
+                payload.strategy_id,
+                payload.status,
+                payload.step_index,
+                payload.search_queries_json,
+                payload.summary,
+                payload.artifacts_json,
+                payload.last_error,
+                payload.started_at,
+                payload.completed_at,
+                payload.created_at,
+                payload.updated_at,
+            ),
+        )
+        return payload
+
+    async def update_research_sub_run(
+        self,
+        sub_run_id: str,
+        *,
+        status: str | None = None,
+        summary: str | None = None,
+        artifacts_json: str | None = None,
+        last_error: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+    ) -> ResearchSubRun | None:
+        current = await self.get_research_sub_run(sub_run_id)
+        if not current:
+            return None
+        updated_at = utc_now_iso()
+        next_payload = ResearchSubRun(
+            id=current.id,
+            job_id=current.job_id,
+            title=current.title,
+            objective=current.objective,
+            profile=current.profile,
+            strategy_id=current.strategy_id,
+            status=current.status if status is None else status,
+            step_index=current.step_index,
+            search_queries_json=current.search_queries_json,
+            summary=current.summary if summary is None else summary,
+            artifacts_json=current.artifacts_json if artifacts_json is None else artifacts_json,
+            last_error=current.last_error if last_error is None else last_error,
+            started_at=current.started_at if started_at is None else started_at,
+            completed_at=current.completed_at if completed_at is None else completed_at,
+            created_at=current.created_at,
+            updated_at=updated_at,
+        )
+        self._execute(
+            """
+            UPDATE research_sub_runs
+            SET status = ?, summary = ?, artifacts_json = ?, last_error = ?, started_at = ?, completed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                next_payload.status,
+                next_payload.summary,
+                next_payload.artifacts_json,
+                next_payload.last_error,
+                next_payload.started_at,
+                next_payload.completed_at,
+                updated_at,
+                sub_run_id,
+            ),
+        )
+        return next_payload
+
+    async def get_research_sub_run(self, sub_run_id: str) -> ResearchSubRun | None:
+        row = self._fetchone("SELECT * FROM research_sub_runs WHERE id = ?", (sub_run_id,))
+        return _row_to_research_sub_run(row) if row else None
+
+    async def list_research_sub_runs(self, job_id: str) -> list[ResearchSubRun]:
+        rows = self._fetchall(
+            "SELECT * FROM research_sub_runs WHERE job_id = ? ORDER BY step_index ASC, created_at ASC",
+            (job_id,),
+        )
+        return [_row_to_research_sub_run(row) for row in rows]
+
+    async def append_research_event(
+        self,
+        job_id: str,
+        *,
+        event_type: str,
+        payload_json: str,
+        sub_run_id: str | None = None,
+    ) -> ResearchEvent:
+        payload = ResearchEvent(
+            id=new_id("revent"),
+            job_id=job_id,
+            sub_run_id=sub_run_id,
+            event_type=event_type,
+            payload_json=payload_json,
+        )
+        self._execute(
+            """
+            INSERT INTO research_events (id, job_id, sub_run_id, event_type, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.id,
+                payload.job_id,
+                payload.sub_run_id,
+                payload.event_type,
+                payload.payload_json,
+                payload.created_at,
+            ),
+        )
+        return payload
+
+    async def list_research_events(self, job_id: str) -> list[ResearchEvent]:
+        rows = self._fetchall(
+            "SELECT * FROM research_events WHERE job_id = ? ORDER BY created_at ASC",
+            (job_id,),
+        )
+        return [_row_to_research_event(row) for row in rows]
+
     async def reset_all_data(self) -> None:
         for table in (
             "messages",
@@ -1125,8 +1415,10 @@ class SQLiteAppRepository(AppRepository):
             "assistant_settings",
             "tasks",
             "files",
-            "research_jobs",
             "research_job_states",
+            "research_events",
+            "research_sub_runs",
+            "research_jobs",
             "users",
         ):
             self._execute(f"DELETE FROM {table}")
@@ -1256,4 +1548,36 @@ def _row_to_research_job_state(row: sqlite3.Row) -> ResearchJobState:
         started_at=row["started_at"],
         completed_at=row["completed_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_research_sub_run(row: sqlite3.Row) -> ResearchSubRun:
+    return ResearchSubRun(
+        id=row["id"],
+        job_id=row["job_id"],
+        title=row["title"],
+        objective=row["objective"],
+        profile=row["profile"],
+        strategy_id=row["strategy_id"],
+        status=row["status"],
+        step_index=int(row["step_index"]),
+        search_queries_json=row["search_queries_json"],
+        summary=row["summary"],
+        artifacts_json=row["artifacts_json"],
+        last_error=row["last_error"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_research_event(row: sqlite3.Row) -> ResearchEvent:
+    return ResearchEvent(
+        id=row["id"],
+        job_id=row["job_id"],
+        sub_run_id=row["sub_run_id"],
+        event_type=row["event_type"],
+        payload_json=row["payload_json"],
+        created_at=row["created_at"],
     )

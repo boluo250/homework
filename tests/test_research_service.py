@@ -68,9 +68,9 @@ class HangingChatProvider(ChatProviderBase):
 
 class FakeQueueBinding:
     def __init__(self) -> None:
-        self.messages: list[dict] = []
+        self.messages: list[object] = []
 
-    async def send(self, payload: dict) -> None:
+    async def send(self, payload) -> None:
         self.messages.append(payload)
 
 
@@ -84,6 +84,9 @@ def test_research_service_generates_structured_report() -> None:
             chat_provider=FakeChatProvider(),
         )
         job = await service.submit(client_id="client_research", query="Cloudflare Worker 上做 RAG 的轻量实现方案")
+        assert job["research_profile"] == "technical_survey"
+        assert job["research_profile_label"] == "技术调研"
+        assert len(job["sub_runs"]) >= 4
         while True:
             current = await service.get(job["id"])
             if current["status"] in {"completed", "failed"}:
@@ -95,6 +98,8 @@ def test_research_service_generates_structured_report() -> None:
         assert "## 关键发现" in report
         assert "## 方案对比" in report
         assert "## 参考来源" in report
+        assert current["sub_runs"]
+        assert all(item["status"] == "completed" for item in current["sub_runs"])
 
     asyncio.run(run())
 
@@ -126,6 +131,8 @@ def test_research_service_queue_mode_persists_state_and_completes() -> None:
         assert current["status"] == "completed"
         assert current["phase"] == "completed"
         assert current["current_step"] == current["total_steps"]
+        assert len(current["events"]) >= 3
+        assert all(item["status"] == "completed" for item in current["sub_runs"])
 
     asyncio.run(run())
 
@@ -248,6 +255,24 @@ def test_research_service_get_finishes_stalled_synthesizing_job_with_fallback() 
         assert "已自动切换为本地汇总结果" in report
         assert "## 执行摘要" in report
         assert "## 参考来源" in report
+
+    asyncio.run(run())
+
+
+def test_research_service_classifies_current_events_queries() -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        service = ResearchService(
+            repository=repository,
+            search_service=FakeSearchService(),
+            web_fetch_service=FakeWebFetchService(),
+            chat_provider=FakeChatProvider(),
+        )
+        job = await service.submit(client_id="client_research_sports", query="调研梅西最近比赛动态和赛果")
+        assert job["research_profile"] == "current_events"
+        assert job["research_profile_label"] == "时效动态"
+        titles = [item["title"] for item in job["sub_runs"]]
+        assert any("时间线" in title or "最近" in title for title in titles)
 
     asyncio.run(run())
 
