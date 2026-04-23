@@ -22,6 +22,7 @@ class IntentInterpretation:
     confidence: float = 0.0
     target_ref: str | None = None
     task_title: str | None = None
+    task_new_title: str | None = None
     task_details: str | None = None
     task_priority: TaskPriority | None = None
     task_start_at: str | None = None
@@ -135,6 +136,7 @@ class LLMIntentInterpreter:
                 "confidence": "number between 0 and 1",
                 "target_ref": "named_task | recent_task | single_task | none | null",
                 "task_title": "string | null",
+                "task_new_title": "string | null",
                 "task_details": "string | null",
                 "task_priority": "high | medium | low | null",
                 "task_start_at": "string | null",
@@ -187,6 +189,9 @@ class LLMIntentInterpreter:
         task_title = _clean_optional_text(payload.get("task_title"))
         if task_title and is_generic_task_reference(task_title):
             task_title = None
+        task_new_title = _clean_optional_text(payload.get("task_new_title"))
+        if task_new_title and is_generic_task_reference(task_new_title):
+            task_new_title = None
 
         interpretation = IntentInterpretation(
             primary_intent=primary_intent,
@@ -199,6 +204,7 @@ class LLMIntentInterpreter:
             confidence=_parse_confidence(payload.get("confidence"), fallback.confidence),
             target_ref=_clean_optional_text(payload.get("target_ref")) or fallback.target_ref,
             task_title=task_title or fallback.task_title,
+            task_new_title=task_new_title or fallback.task_new_title,
             task_details=_clean_optional_text(payload.get("task_details")) or fallback.task_details,
             task_priority=_parse_priority(payload.get("task_priority")) or fallback.task_priority,
             task_start_at=_clean_optional_text(payload.get("task_start_at")) or fallback.task_start_at,

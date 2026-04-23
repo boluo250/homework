@@ -50,6 +50,8 @@ def test_router_prompt_bundle_uses_router_registry_entry() -> None:
     )
     assert bundle.bundle_id == "router.main"
     assert "You are the action router for a Chinese task assistant." in bundle.system_prompt
+    assert "title is the task to locate now; new_title is the renamed title after the update" in bundle.system_prompt
+    assert "only modify fields the user explicitly asked to change" in bundle.system_prompt
 
 
 def test_file_prompt_bundle_uses_registry_mode_template() -> None:

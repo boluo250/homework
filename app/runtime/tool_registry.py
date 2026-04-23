@@ -66,12 +66,18 @@ class ToolRegistry:
             ),
             ToolDefinition(
                 name=TaskToolAction.UPDATE.value,
-                description="Update an existing task by title or recent reference.",
+                description=(
+                    "Update an existing task by title or recent reference. "
+                    "Use title only to identify the existing task. "
+                    "Use new_title only when the user explicitly wants to rename the task. "
+                    "Only send fields the user explicitly asked to change; omit all others."
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "title": {"type": "string"},
                         "target_ref": {"type": "string", "enum": ["recent_task", "single_task", "named_task"]},
+                        "new_title": {"type": "string"},
                         "details": {"type": "string"},
                         "status": {"type": "string", "enum": ["todo", "in_progress", "done"]},
                         "priority": {"type": "string", "enum": ["low", "medium", "high"]},

@@ -125,9 +125,32 @@ def test_demo_e2e_chat_task_and_search_flow(tmp_path: Path) -> None:
         assert "已创建你的待办" in created["reply"]
         assert "需求" in created["reply"]
 
+        tasks_before_patch = await request_json(container, "GET", f"/api/tasks?client_id={client_id}")
+        [created_task] = tasks_before_patch["tasks"]
+        patched = await request_json(
+            container,
+            "PATCH",
+            "/api/tasks",
+            {
+                "client_id": client_id,
+                "task_id": created_task["id"],
+                "title": "面试作业-终版",
+                "details": "突出 Agent、RAG、Cloudflare Worker、D1 项目经验",
+                "status": "in_progress",
+                "priority": "medium",
+                "start_at": "2026-04-25",
+                "end_at": "2026-05-01",
+            },
+        )
+        assert patched["task"]["title"] == "面试作业-终版"
+        assert patched["task"]["status"] == "in_progress"
+        assert patched["task"]["priority"] == "medium"
+        assert patched["task"]["start_at"] == "2026-04-25"
+        assert patched["task"]["end_at"] == "2026-05-01"
+
         listed = await chat(container, client_id, "列出我的任务", conversation_id=profile["conversation_id"])
-        assert "面试作业" in listed["reply"]
-        assert "Cloudflare Worker" in listed["reply"]
+        assert "面试作业-终版" in listed["reply"]
+        assert "Cloudflare Worker、D1" in listed["reply"]
 
         task_detail = await chat(
             container,
@@ -136,7 +159,7 @@ def test_demo_e2e_chat_task_and_search_flow(tmp_path: Path) -> None:
             conversation_id=profile["conversation_id"],
         )
         assert "待办详情" in task_detail["reply"]
-        assert "Cloudflare Worker 项目经验" in task_detail["reply"]
+        assert "Cloudflare Worker、D1 项目经验" in task_detail["reply"]
 
         search_result = await chat(
             container,

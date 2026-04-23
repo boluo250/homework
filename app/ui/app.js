@@ -79,9 +79,12 @@ dom.messageInput.addEventListener("keydown", async (event) => {
 async function submitChat() {
   const message = dom.messageInput.value.trim();
   if (!message) return;
-
-  appendMessage("user", message);
   dom.messageInput.value = "";
+  await sendChatMessage(message);
+}
+
+async function sendChatMessage(message) {
+  appendMessage("user", message);
   const pendingMessageId = appendMessage("assistant", "", {
     thinking: true,
     thinkingLabel: pendingChatLabel(message),
@@ -120,8 +123,10 @@ async function submitChat() {
     if (payload.intent === "deep_research") {
       await submitResearchJob(message);
     }
+    return payload;
   } catch (error) {
     updateMessage(pendingMessageId, `请求失败：${error.message}`);
+    return null;
   } finally {
     setComposerBusy(false);
   }
@@ -257,12 +262,57 @@ async function refreshTasks(userId = "") {
         <span class="badge">${task.priority}</span>
       </div>
       ${task.details ? `<p class="muted">${escapeHtml(task.details)}</p>` : ""}
-      <p class="muted">status: ${statusLabel(task.status)}</p>
-      <p class="muted">due: ${task.due_at || "n/a"}</p>
-      <p class="muted">updated: ${formatDate(task.updated_at)}</p>
+      <div class="task-meta-grid">
+        <p class="muted">status: ${statusLabel(task.status)}</p>
+        <p class="muted">start: ${task.start_at || "n/a"}</p>
+        <p class="muted">end: ${task.end_at || task.due_at || "n/a"}</p>
+        <p class="muted">updated: ${formatDate(task.updated_at)}</p>
+      </div>
+      <div class="task-actions">
+        <button class="ghost-button" type="button" data-edit-task-id="${escapeHtml(task.id)}">AI 修改</button>
+      </div>
     `;
     dom.taskList.appendChild(card);
   }
+
+  dom.taskList.querySelectorAll("[data-edit-task-id]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const taskId = button.dataset.editTaskId;
+      const task = payload.tasks.find((item) => item.id === taskId);
+      if (!task) {
+        return;
+      }
+      await editTask(task);
+    });
+  });
+}
+
+async function editTask(task) {
+  const instruction = window.prompt(
+    "告诉 AI 你想怎么修改这个任务。示例：标题改成“面试作业终版”，优先级改高，状态改成进行中，开始日期改成 2026-05-01，结束日期改成 2026-05-03",
+    "",
+  );
+  if (instruction === null || !instruction.trim()) {
+    return;
+  }
+
+  const message = [
+    `请帮我修改任务“${task.title}”。`,
+    "当前任务信息：",
+    `- 标题：${task.title}`,
+    `- 状态：${task.status}`,
+    `- 优先级：${task.priority}`,
+    `- 开始日期：${task.start_at || "未设置"}`,
+    `- 结束日期：${task.end_at || task.due_at || "未设置"}`,
+    `- 具体需求：${task.details || "暂无具体需求"}`,
+    "",
+    "修改要求：",
+    instruction.trim(),
+    "",
+    "只修改我明确提到的字段，其余字段保持不变。",
+  ].join("\n");
+
+  await sendChatMessage(message);
 }
 
 async function refreshFiles(userId = "") {

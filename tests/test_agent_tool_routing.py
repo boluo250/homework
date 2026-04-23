@@ -65,6 +65,23 @@ class FakeToolCallingProvider(ChatProviderBase):
             return ToolChatResponse(
                 tool_calls=[ToolCall(name="recall_profile", arguments={"field": "name"})]
             )
+        if "修改任务" in user_message and "面试作业" in user_message:
+            return ToolChatResponse(
+                tool_calls=[
+                    ToolCall(
+                        name="update_task",
+                        arguments={
+                            "title": "面试作业",
+                            "new_title": "面试作业终版",
+                            "details": "突出 Agent、RAG、Cloudflare Worker、D1 项目经验",
+                            "status": "in_progress",
+                            "priority": "high",
+                            "start_at": "2026-04-25",
+                            "end_at": "2026-05-01",
+                        },
+                    )
+                ]
+            )
         if "帮我创建个任务" in user_message:
             return ToolChatResponse(
                 tool_calls=[ToolCall(name="create_task", arguments={"title": "个"})]
@@ -179,6 +196,48 @@ def test_tool_routing_can_save_profile_then_create_task(tmp_path) -> None:
             )
         )
         assert recalled.reply == "我记得你叫 小李。"
+
+    asyncio.run(run())
+
+
+def test_tool_routing_can_update_full_task_via_model(tmp_path) -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        agent = AssistantAgent(
+            repository=repository,
+            chat_provider=FakeToolCallingProvider(),
+            search_service=SearchService(),
+            rag_service=RagService(
+                embedding_provider=RemoteEmbeddingProvider(),
+                qdrant_store=QdrantStore(storage_path=tmp_path / "vectors.json"),
+            ),
+        )
+
+        created = await agent.handle_chat(
+            ChatRequest(
+                client_id="client_tool_update",
+                message='我叫小李，邮箱 xiaoli@example.com，帮我创建一个"面试作业"任务，开始日期 2026-04-24，结束日期 2026-04-30',
+            )
+        )
+        updated = await agent.handle_chat(
+            ChatRequest(
+                client_id="client_tool_update",
+                conversation_id=created.conversation_id,
+                message='请修改任务“面试作业”：标题改成“面试作业终版”，优先级改高，状态改成进行中，开始日期改成 2026-04-25，结束日期改成 2026-05-01，需求补充 D1 项目经验',
+            )
+        )
+
+        user = await repository.get_or_create_user("client_tool_update")
+        tasks = await repository.list_tasks(user.id)
+
+        assert "任务已更新：面试作业终版" in updated.reply
+        assert len(tasks) == 1
+        assert tasks[0].title == "面试作业终版"
+        assert tasks[0].status.value == "in_progress"
+        assert tasks[0].priority.value == "high"
+        assert tasks[0].start_at == "2026-04-25"
+        assert tasks[0].end_at == "2026-05-01"
+        assert "D1" in tasks[0].details
 
     asyncio.run(run())
 
