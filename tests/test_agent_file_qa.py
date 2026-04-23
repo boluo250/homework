@@ -12,6 +12,8 @@ from app.services.qdrant_store import QdrantStore
 from app.services.r2_store import R2FileStore
 from app.services.rag_service import RagService
 from app.services.search_service import SearchService
+from app.state.file_state import FileState
+from app.tools.rag_tool import RagTool
 
 
 class FakeChatProvider(ChatProviderBase):
@@ -54,6 +56,21 @@ class FakeChatProvider(ChatProviderBase):
               "explanation": "selected file question"
             }
             """
+        return "这是一段归纳后的回答。\nEVIDENCE_IDS: [1]"
+
+
+class NoEvidenceIdChatProvider(FakeChatProvider):
+    async def chat(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+    ) -> str:
+        if "strict intent interpreter" in system_prompt:
+            return await super().chat(system_prompt=system_prompt, user_message=user_message)
+        self.calls.append((system_prompt, user_message))
+        self.system_prompt = system_prompt
+        self.user_message = user_message
         return "这是一段归纳后的回答。"
 
 
@@ -99,9 +116,140 @@ def test_file_qa_uses_llm_to_summarize_retrieved_context(tmp_path) -> None:
         )
         assert response.reply.startswith("这是一段归纳后的回答。")
         assert "参考来源" in response.reply
+        assert response.reply.count("#片段") == 1
         assert "Retrieved evidence" in chat_provider.system_prompt
         assert "Full document context" in chat_provider.system_prompt
+        assert "EVIDENCE_IDS: [ids]" in chat_provider.system_prompt
         assert "不要只摘抄原文" in chat_provider.user_message
         assert "整体概括" in chat_provider.user_message
+
+    asyncio.run(run())
+
+
+def test_file_inventory_lists_persisted_uploads_without_tool_calls(tmp_path) -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        chat_provider = FakeChatProvider()
+        qdrant = QdrantStore(storage_path=tmp_path / "vectors.json")
+        file_service = FileService(
+            repository=repository,
+            file_store=R2FileStore(tmp_path / "r2"),
+            file_parser=FileParser(),
+            embedding_provider=RemoteEmbeddingProvider(),
+            qdrant_store=qdrant,
+        )
+        await file_service.upload_base64_file(
+            client_id="client_inventory",
+            filename="readme.md",
+            content_type="text/markdown",
+            content_base64=base64.b64encode(b"# Demo\nRAG inventory test.").decode("utf-8"),
+        )
+        rag_tool = RagTool(
+            file_state=FileState(repository),
+            file_service=file_service,
+            rag_service=RagService(embedding_provider=RemoteEmbeddingProvider(), qdrant_store=qdrant),
+            chat_provider=chat_provider,
+        )
+        agent = AssistantAgent(
+            repository=repository,
+            chat_provider=chat_provider,
+            search_service=SearchService(),
+            rag_service=RagService(
+                embedding_provider=RemoteEmbeddingProvider(),
+                qdrant_store=qdrant,
+            ),
+            rag_tool=rag_tool,
+        )
+        response = await agent.handle_chat(
+            ChatRequest(client_id="client_inventory", message="查询数据库里有哪些文档")
+        )
+        assert "readme.md" in response.reply
+        assert any(tr.name == "list_uploaded_files" and tr.ok for tr in response.tool_results)
+
+    asyncio.run(run())
+
+
+def test_file_qa_uses_compare_prompt_bundle(tmp_path) -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        chat_provider = FakeChatProvider()
+        qdrant = QdrantStore(storage_path=tmp_path / "vectors.json")
+        file_service = FileService(
+            repository=repository,
+            file_store=R2FileStore(tmp_path / "r2"),
+            file_parser=FileParser(),
+            embedding_provider=RemoteEmbeddingProvider(),
+            qdrant_store=qdrant,
+        )
+        uploaded = await file_service.upload_base64_file(
+            client_id="client_compare",
+            filename="compare.txt",
+            content_type="text/plain",
+            content_base64=base64.b64encode(
+                (
+                    "方案A\n成本低，适合 MVP。\n\n"
+                    "方案B\n扩展性强，适合长期演进。"
+                ).encode("utf-8")
+            ).decode("utf-8"),
+        )
+        agent = AssistantAgent(
+            repository=repository,
+            chat_provider=chat_provider,
+            search_service=SearchService(),
+            rag_service=RagService(
+                embedding_provider=RemoteEmbeddingProvider(),
+                qdrant_store=qdrant,
+            ),
+        )
+        response = await agent.handle_chat(
+            ChatRequest(
+                client_id="client_compare",
+                message="对比一下这个文档里的方案A和方案B",
+                file_ids=[uploaded["file"]["id"]],
+            )
+        )
+        assert response.reply.startswith("这是一段归纳后的回答。")
+        assert "Template: compare." in chat_provider.system_prompt
+        assert "按维度比较相同点、不同点和适用场景" in chat_provider.user_message
+
+    asyncio.run(run())
+
+
+def test_file_qa_without_evidence_ids_does_not_append_blind_citations(tmp_path) -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        chat_provider = NoEvidenceIdChatProvider()
+        qdrant = QdrantStore(storage_path=tmp_path / "vectors.json")
+        file_service = FileService(
+            repository=repository,
+            file_store=R2FileStore(tmp_path / "r2"),
+            file_parser=FileParser(),
+            embedding_provider=RemoteEmbeddingProvider(),
+            qdrant_store=qdrant,
+        )
+        uploaded = await file_service.upload_base64_file(
+            client_id="client_no_ids",
+            filename="notes.txt",
+            content_type="text/plain",
+            content_base64=base64.b64encode(b"alpha\nbeta\ngamma").decode("utf-8"),
+        )
+        agent = AssistantAgent(
+            repository=repository,
+            chat_provider=chat_provider,
+            search_service=SearchService(),
+            rag_service=RagService(
+                embedding_provider=RemoteEmbeddingProvider(),
+                qdrant_store=qdrant,
+            ),
+        )
+        response = await agent.handle_chat(
+            ChatRequest(
+                client_id="client_no_ids",
+                message="总结一下这个文档",
+                file_ids=[uploaded["file"]["id"]],
+            )
+        )
+        assert response.reply == "这是一段归纳后的回答。"
+        assert "参考来源" not in response.reply
 
     asyncio.run(run())

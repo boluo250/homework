@@ -5,10 +5,11 @@ import re
 from typing import Any
 
 from app.core.intent_interpreter import IntentInterpretation, LLMIntentInterpreter
+from app.services.file_service import MEDIA_INGEST_STAGING_PREFIX
 from app.core.models import ChatRequest, ChatResponse, Intent, TaskPriority, TaskStatus, ToolResult
 from app.core.task_protocol import TaskToolAction, is_generic_task_reference
 from app.providers.llm_base import ChatProviderBase, ToolCall, ToolDefinition
-from app.runtime.prompt_builder import build_chat_system_prompt, build_tool_router_prompt
+from app.runtime.prompt_builder import build_chat_system_prompt, build_file_qa_prompt_bundle, build_tool_router_prompt
 from app.runtime.session_context import ConversationContextManager
 from app.runtime.skills_loader import SkillsLoader
 from app.runtime.tool_registry import ToolRegistry
@@ -20,6 +21,7 @@ from app.state.assistant_state import AssistantState
 from app.state.task_state import TaskState
 from app.state.user_state import UserState
 from app.tools.assistant_identity_tool import AssistantIdentityTool
+from app.tools.file_qa_citations import append_file_citations, extract_answer_and_used_evidence_ids
 from app.tools.profile_tool import ProfileTool
 from app.tools.rag_tool import RagTool
 from app.tools.research_tool import ResearchTool
@@ -313,6 +315,13 @@ class AssistantAgent:
                 primary_intent = self._merge_primary_intent(primary_intent, Intent.FILE_QA)
                 continue
 
+            if tool_name == "list_uploaded_files":
+                inv_reply, inv_results = await self._list_uploaded_files_reply(user_id=user.id)
+                tool_results.extend(inv_results)
+                reply_parts.append(inv_reply)
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.FILE_QA)
+                continue
+
             tool_results.append(ToolResult(name=tool_name, ok=False, content={"reason": "unknown_tool"}))
 
         if not reply_parts:
@@ -412,11 +421,14 @@ class AssistantAgent:
                 "下方研究结果区会持续刷新进度，这里先把研究计划同步给你：\n"
                 + "\n".join(f"- {item}" for item in plan)
             )
+        elif intent == Intent.FILE_QA and interpretation.file_action == "inventory":
+            reply, tool_results = await self._list_uploaded_files_reply(user_id=user.id)
         elif intent == Intent.FILE_QA:
             reply, tool_results = await self._handle_file_qa(
                 user_id=user.id,
                 message=request.message,
                 file_ids=request.file_ids,
+                answer_mode=interpretation.file_answer_mode,
             )
         else:
             semantic_memories = await self._load_semantic_memories(user.id, request.message)
@@ -528,15 +540,45 @@ class AssistantAgent:
         }
         return incoming if order[incoming] >= order[current] else current
 
+    async def _list_uploaded_files_reply(self, *, user_id: str) -> tuple[str, list[ToolResult]]:
+        if self.rag_tool is None:
+            return (
+                "当前对话环境未接入文件索引服务，无法列出已上传文档。",
+                [ToolResult(name="list_uploaded_files", ok=False, content={"reason": "rag_tool_unavailable"})],
+            )
+        files = await self.rag_tool.list_files(user_id)
+        tool_results = [ToolResult(name="list_uploaded_files", ok=True, content={"files": files})]
+        if not files:
+            return (
+                "你当前账号下还没有任何已上传并入库的文档。上传成功后我会写入元数据与向量索引，之后你就可以让我列出清单或直接提问。",
+                tool_results,
+            )
+        lines: list[str] = ["这是你账号下已保存、可检索的文档清单（来自持久化存储，不限于本次会话中勾选的文件）："]
+        for item in files[:40]:
+            fn = str(item.get("filename", "unknown"))
+            fid = str(item.get("id", ""))
+            vc = int(item.get("vector_count") or 0)
+            hint = _file_ingest_hint_for_list(summary=item.get("summary"), vector_count=vc)
+            lines.append(f"- {fn}（file_id={fid}，已向量化片段约 {vc} 条{hint}）")
+        if len(files) > 40:
+            lines.append(f"... 共 {len(files)} 份，此处仅列出前 40 份。")
+        return ("\n".join(lines), tool_results)
+
     async def _handle_file_qa(
         self,
         *,
         user_id: str,
         message: str,
         file_ids: list[str] | None,
+        answer_mode: str | None = None,
     ) -> tuple[str, list[ToolResult]]:
         if self.rag_tool is not None:
-            outcome = await self.rag_tool.answer(user_id=user_id, message=message, file_ids=file_ids)
+            outcome = await self.rag_tool.answer(
+                user_id=user_id,
+                message=message,
+                file_ids=file_ids,
+                answer_mode=answer_mode,
+            )
             return outcome.reply, outcome.tool_results
         self._log_file_qa(
             "start",
@@ -577,7 +619,7 @@ class AssistantAgent:
 
         evidence_blocks = []
         total_chars = 0
-        question_mode = _infer_document_qa_mode(message)
+        question_mode = answer_mode or _infer_document_qa_mode(message)
         full_document_context = await self._build_selected_document_context(
             user_id=user_id,
             selected_files=selected_files,
@@ -600,24 +642,12 @@ class AssistantAgent:
             evidence_blocks.append(block)
             total_chars += len(block)
 
-        system_prompt = "\n\n".join(
-            [
-                "You are a file question-answering assistant.",
-                "Use the retrieved snippets as evidence, but do not dump them back verbatim unless the user explicitly asks for quotes.",
-                "Tailor the response style to the user's question: summarize when asked for a summary, compare when asked for comparison, answer directly when asked a specific question, and extract structured facts when the user asks for fields or items.",
-                "When the user asks to introduce, summarize, analyze, or review one or more documents, synthesize the answer into clear Chinese instead of listing raw snippets.",
-                "Prefer clear structure: direct answer first, then key evidence or key points, then a short conclusion when helpful.",
-                "If the evidence is partial or conflicting, say so explicitly.",
-                "Do not stop mid-sentence. Produce a complete answer.",
-                "If full document context is available, use it to improve completeness. If only partial retrieved evidence is available, say that the answer is based on partial context.",
-                "Available file summaries:\n" + ("\n".join(file_descriptions) if file_descriptions else "- 暂无文件摘要"),
-                "Full document context:\n" + (full_document_context or "未提供全文上下文"),
-                "Retrieved evidence:\n" + "\n\n".join(evidence_blocks),
-            ]
-        )
-        user_prompt = (
-            f"用户问题：{message}\n\n"
-            + _build_document_qa_instruction(question_mode)
+        system_prompt, user_prompt = build_file_qa_prompt_bundle(
+            question=message,
+            question_mode=question_mode,
+            file_descriptions=file_descriptions,
+            full_document_context=full_document_context,
+            evidence_blocks=evidence_blocks,
         )
         self._log_file_qa(
             "model_call.start",
@@ -648,9 +678,13 @@ class AssistantAgent:
             preview=reply[:240],
             provider_failure=self._looks_like_provider_failure(reply),
         )
+        used_evidence_ids: list[int] = []
         if self._looks_like_provider_failure(reply):
             reply = self._fallback_file_qa_reply(message, rag_hits)
-        reply = self._append_file_citations(reply, rag_hits)
+            used_evidence_ids = list(range(1, min(len(rag_hits), 4) + 1))
+        else:
+            reply, used_evidence_ids = extract_answer_and_used_evidence_ids(reply, evidence_count=len(evidence_blocks))
+        reply = append_file_citations(reply, rag_hits, used_evidence_ids=used_evidence_ids)
         return reply, tool_results
 
     async def _build_selected_document_context(
@@ -812,22 +846,6 @@ class AssistantAgent:
             lines.append(f"- {role}: {text[:180]}")
         return lines
 
-    def _append_file_citations(self, reply: str, rag_hits: list[dict]) -> str:
-        citations: list[str] = []
-        seen: set[tuple[str, int]] = set()
-        for hit in rag_hits[:4]:
-            payload = hit.get("payload", {})
-            filename = str(payload.get("filename", "unknown"))
-            chunk_index = int(payload.get("chunk_index", 0))
-            key = (filename, chunk_index)
-            if key in seen:
-                continue
-            seen.add(key)
-            citations.append(f"- {filename}#片段{chunk_index}")
-        if not citations:
-            return reply
-        return reply.rstrip() + "\n\n参考来源：\n" + "\n".join(citations)
-
     def _looks_like_provider_failure(self, reply: str) -> bool:
         lowered = reply.strip().lower()
         return lowered.startswith("openrouter provider is not configured") or lowered.startswith(
@@ -862,6 +880,24 @@ class AssistantAgent:
             print(f"[taskmate] {json.dumps(payload, ensure_ascii=False, default=str)}")
         except Exception:  # noqa: BLE001
             print(f"[taskmate] file_qa event={event} fields={fields!r}")
+
+
+def _file_ingest_hint_for_list(*, summary: object, vector_count: int) -> str:
+    """Aligns with FileService summary markers for async video ingest (see file_service.MEDIA_INGEST_PENDING)."""
+    if vector_count > 0:
+        return ""
+    s = str(summary or "").strip()
+    if s == "[ingest_pending]":
+        return "；状态：视频/大媒体已入队，转写与向量化在 Queue 消费者中执行（未完成前为 0 条）"
+    if s.startswith(MEDIA_INGEST_STAGING_PREFIX):
+        return "；状态：多模态转写已完成，向量化在第二条队列任务中执行（尚未写入向量）"
+    if s.startswith("[ingest_failed]"):
+        body = s.removeprefix("[ingest_failed]").strip()
+        short = (body[:100] + "…") if len(body) > 100 else body
+        return f"；状态：转写失败（{short}）" if short else "；状态：转写失败"
+    if s == "[ingest_empty]":
+        return "；状态：模型返回空文本，未生成可索引片段"
+    return ""
 
 
 def _clean_tool_text(value: object) -> str | None:

@@ -155,6 +155,10 @@ class AppRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def update_file_summary(self, user_id: str, file_id: str, *, summary: str | None) -> FileRecord | None:
+        raise NotImplementedError
+
+    @abstractmethod
     async def delete_file(self, user_id: str, file_id: str) -> FileRecord | None:
         raise NotImplementedError
 
@@ -441,6 +445,13 @@ class InMemoryAppRepository(AppRepository):
         if not record:
             return None
         record.filename = filename
+        return record
+
+    async def update_file_summary(self, user_id: str, file_id: str, *, summary: str | None) -> FileRecord | None:
+        record = await self.get_file(user_id, file_id)
+        if not record:
+            return None
+        record.summary = summary
         return record
 
     async def delete_file(self, user_id: str, file_id: str) -> FileRecord | None:
@@ -926,6 +937,22 @@ class SQLiteAppRepository(AppRepository):
             size_bytes=record.size_bytes,
             r2_key=record.r2_key,
             summary=record.summary,
+            created_at=record.created_at,
+        )
+
+    async def update_file_summary(self, user_id: str, file_id: str, *, summary: str | None) -> FileRecord | None:
+        record = await self.get_file(user_id, file_id)
+        if not record:
+            return None
+        self._execute("UPDATE files SET summary = ? WHERE id = ? AND user_id = ?", (summary, file_id, user_id))
+        return FileRecord(
+            id=record.id,
+            user_id=record.user_id,
+            filename=record.filename,
+            content_type=record.content_type,
+            size_bytes=record.size_bytes,
+            r2_key=record.r2_key,
+            summary=summary,
             created_at=record.created_at,
         )
 

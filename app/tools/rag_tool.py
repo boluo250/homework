@@ -4,10 +4,12 @@ import re
 
 from app.core.models import ToolResult
 from app.providers.llm_base import ChatProviderBase
+from app.runtime.prompt_builder import build_file_qa_prompt_bundle
 from app.services.file_service import FileService
 from app.services.rag_service import RagService
 from app.state.file_state import FileState
 from app.tools.base import ToolOutcome
+from app.tools.file_qa_citations import append_file_citations, extract_answer_and_used_evidence_ids
 
 
 class RagTool:
@@ -73,6 +75,7 @@ class RagTool:
         user_id: str,
         message: str,
         file_ids: list[str] | None,
+        answer_mode: str | None = None,
     ) -> ToolOutcome:
         rag_hits = await self.search(user_id=user_id, query=message, file_ids=file_ids, limit=6)
         tool_results = [ToolResult(name="file_qa", ok=True, content=rag_hits)]
@@ -91,7 +94,7 @@ class RagTool:
 
         evidence_blocks = []
         total_chars = 0
-        question_mode = _infer_document_qa_mode(message)
+        question_mode = answer_mode or _infer_document_qa_mode(message)
         full_document_context = await self._build_selected_document_context(
             user_id=user_id,
             selected_files=selected_files,
@@ -113,26 +116,24 @@ class RagTool:
             evidence_blocks.append(block)
             total_chars += len(block)
 
-        system_prompt = "\n\n".join(
-            [
-                "You are a file question-answering assistant.",
-                "Use the retrieved snippets as evidence, but do not dump them back verbatim unless the user explicitly asks for quotes.",
-                "Tailor the response style to the user's question: summarize when asked for a summary, compare when asked for comparison, answer directly when asked a specific question, and extract structured facts when the user asks for fields or items.",
-                "When the user asks to introduce, summarize, analyze, or review one or more documents, synthesize the answer into clear Chinese instead of listing raw snippets.",
-                "Prefer clear structure: direct answer first, then key evidence or key points, then a short conclusion when helpful.",
-                "If the evidence is partial or conflicting, say so explicitly.",
-                "Do not stop mid-sentence. Produce a complete answer.",
-                "If full document context is available, use it to improve completeness. If only partial retrieved evidence is available, say that the answer is based on partial context.",
-                "Available file summaries:\n" + ("\n".join(file_descriptions) if file_descriptions else "- 暂无文件摘要"),
-                "Full document context:\n" + (full_document_context or "未提供全文上下文"),
-                "Retrieved evidence:\n" + "\n\n".join(evidence_blocks),
-            ]
+        system_prompt, user_prompt = build_file_qa_prompt_bundle(
+            question=message,
+            question_mode=question_mode,
+            file_descriptions=file_descriptions,
+            full_document_context=full_document_context,
+            evidence_blocks=evidence_blocks,
         )
-        user_prompt = f"用户问题：{message}\n\n" + _build_document_qa_instruction(question_mode)
         reply = await self.chat_provider.chat(system_prompt=system_prompt, user_message=user_prompt)
+        used_evidence_ids: list[int] = []
         if _looks_like_provider_failure(reply):
             reply = _fallback_file_qa_reply(message, rag_hits)
-        return ToolOutcome(reply=_append_file_citations(reply, rag_hits), tool_results=tool_results)
+            used_evidence_ids = list(range(1, min(len(rag_hits), 4) + 1))
+        else:
+            reply, used_evidence_ids = extract_answer_and_used_evidence_ids(reply, evidence_count=len(evidence_blocks))
+        return ToolOutcome(
+            reply=append_file_citations(reply, rag_hits, used_evidence_ids=used_evidence_ids),
+            tool_results=tool_results,
+        )
 
     async def _build_selected_document_context(
         self,
@@ -166,25 +167,6 @@ class RagTool:
             if total_chars >= 12000:
                 break
         return "\n\n".join(sections).strip()
-
-
-def _append_file_citations(reply: str, rag_hits: list[dict]) -> str:
-    citations: list[str] = []
-    seen: set[tuple[str, int]] = set()
-    for hit in rag_hits[:4]:
-        payload = hit.get("payload", {})
-        filename = str(payload.get("filename", "unknown"))
-        chunk_index = int(payload.get("chunk_index", 0))
-        key = (filename, chunk_index)
-        if key in seen:
-            continue
-        seen.add(key)
-        citations.append(f"- {filename}#片段{chunk_index}")
-    if not citations:
-        return reply
-    return reply.rstrip() + "\n\n参考来源：\n" + "\n".join(citations)
-
-
 def _looks_like_provider_failure(reply: str) -> bool:
     lowered = reply.strip().lower()
     return lowered.startswith("openrouter provider is not configured") or lowered.startswith("openrouter request failed")

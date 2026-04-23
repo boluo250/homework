@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 from uuid import uuid4
+
+_STABLE_OBJECT_KEY_RE = re.compile(r"^[a-zA-Z0-9._-]{1,512}$")
 
 
 class CloudflareR2FileStore:
@@ -21,6 +24,18 @@ class CloudflareR2FileStore:
             # Fallback for non-Pyodide environments
             await self.bucket.put(key, content)
         return f"r2://{self.bucket_name}/{key}"
+
+    async def save_bytes_with_object_key(self, object_key: str, content: bytes) -> str:
+        if not _STABLE_OBJECT_KEY_RE.match(object_key):
+            raise ValueError("Invalid object_key for stable R2 write")
+        try:
+            import js
+            uint8_array = js.Uint8Array.new(len(content))
+            uint8_array.assign(content)
+            await self.bucket.put(object_key, uint8_array)
+        except ImportError:
+            await self.bucket.put(object_key, content)
+        return f"r2://{self.bucket_name}/{object_key}"
 
     async def read_file(self, r2_key: str) -> bytes:
         key = r2_key.rsplit("/", 1)[-1]

@@ -62,8 +62,11 @@ tests/
    `npx wrangler secret put MISTRAL_API_KEY`
    `npx wrangler secret put SERPER_API_KEY`
    `npx wrangler secret put QDRANT_API_KEY`
-5. Create the research queue:
+5. Create queues (research vs video/media ingest are separate so you can purge or observe one without touching the other):
    `npx wrangler queues create taskmate-research-jobs`
+   `npx wrangler queues create taskmate-media-ingest`
+   If `MEDIA_INGEST_QUEUE` is not bound, video ingest falls back to sending on `RESEARCH_QUEUE` (legacy single-queue behavior).
+   Video ingest uses two queue messages (transcribe -> embed) plus batched embeddings to reduce CPU spikes. This repo now keeps `wrangler.toml` compatible with **Workers Free** by default; on Free, prefer short videos and expect large media jobs to be more failure-prone due to CPU limits.
 6. Apply the schema:
    `npx wrangler d1 execute taskmate-homework-db --file migrations/001_init.sql --remote`
 7. Deploy:

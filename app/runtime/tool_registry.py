@@ -128,8 +128,21 @@ class ToolRegistry:
                 },
             ),
             ToolDefinition(
+                name="list_uploaded_files",
+                description=(
+                    "List the user's uploaded documents from persistent storage (database metadata + vector counts). "
+                    "Use when the user asks what files/documents exist, what is in the workspace or knowledge base, "
+                    "or to enumerate uploads—not limited to the current UI selection."
+                ),
+                parameters={"type": "object", "properties": {}, "additionalProperties": False},
+            ),
+            ToolDefinition(
                 name="answer_file_question",
-                description="Answer a question about the selected uploaded files using retrieval and synthesis.",
+                description=(
+                    "Answer a question using RAG over the user's indexed uploads. "
+                    "When file_ids is omitted or empty, retrieval runs across all of the user's documents; "
+                    "when the UI passes selected file_ids, prefer scoping to those files."
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
@@ -159,6 +172,7 @@ class ToolRegistry:
             TaskToolAction.LIST.value: 2,
             "start_research": 3,
             "search_web": 3,
+            "list_uploaded_files": 2,
             "answer_file_question": 3,
         }
         ordered = sorted(enumerate(tool_calls), key=lambda item: (priority.get(item[1].name, 99), item[0]))

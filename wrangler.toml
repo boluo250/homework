@@ -30,8 +30,18 @@ preview_bucket_name = "taskmate-homework-files-dev"
 binding = "RESEARCH_QUEUE"
 queue = "taskmate-research-jobs"
 
+[[queues.producers]]
+binding = "MEDIA_INGEST_QUEUE"
+queue = "taskmate-media-ingest"
+
 [[queues.consumers]]
 queue = "taskmate-research-jobs"
+max_batch_size = 1
+max_batch_timeout = 2
+max_retries = 3
+
+[[queues.consumers]]
+queue = "taskmate-media-ingest"
 max_batch_size = 1
 max_batch_timeout = 2
 max_retries = 3

@@ -38,7 +38,7 @@ from app.services.openrouter_client import OpenRouterClient
 from app.services.qdrant_store import QdrantStore
 from app.services.r2_store import R2FileStore
 from app.services.rag_service import RagService
-from app.services.research_service import ResearchService
+from app.services.research_service import ResearchService, _normalize_queue_message
 from app.services.search_service import SearchService
 from app.services.schema_sql import SCHEMA_SQL
 from app.services.web_fetch_service import WebFetchService
@@ -75,6 +75,17 @@ APP_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = APP_DIR.parent
 DATA_DIR = WORKSPACE_ROOT / ".taskmate"
 _APP_CONTAINER: AppContainer | None = None
+
+# Queue names must match wrangler.toml [[queues.*]] queue = "..."
+_CLOUDFLARE_RESEARCH_QUEUE_NAME = "taskmate-research-jobs"
+_CLOUDFLARE_MEDIA_INGEST_QUEUE_NAME = "taskmate-media-ingest"
+
+
+def _batch_queue_name(batch: Any) -> str:
+    raw = getattr(batch, "queue", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return ""
 
 
 class AppContainer:
@@ -147,6 +158,7 @@ class AppContainer:
                     app_name=getattr(env, "APP_NAME", "TaskMate"),
                 ),
             ),
+            ingest_queue=getattr(env, "MEDIA_INGEST_QUEUE", None) or getattr(env, "RESEARCH_QUEUE", None),
         )
         self.research_service = ResearchService(
             repository=repository,
@@ -313,13 +325,110 @@ class Default(WorkerEntrypoint):
         response = await route_request(http_request, container)
         return Response(response.body, status=response.status, headers=response.headers)
 
-    async def queue(self, batch) -> None:
+    async def queue(self, batch, *_args: Any, **_kwargs: Any) -> None:
+        """Queue consumer; runtime may pass extra positional args (e.g. env, ctx) beyond ``batch``."""
         import traceback as _tb
         container = get_container(self.env)
+        batch_queue = _batch_queue_name(batch)
         print(
-            f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'batch.start', 'message_count': len(getattr(batch, 'messages', []) or [])}, ensure_ascii=False)}"
+            f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'batch.start', 'message_count': len(getattr(batch, 'messages', []) or []), 'queue': batch_queue or None}, ensure_ascii=False)}"
         )
         for message in getattr(batch, "messages", []):
+            try:
+                payload = _normalize_queue_message(message.body)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.bad_payload', 'error': str(exc)}, ensure_ascii=False)}"
+                )
+                if hasattr(message, "ack"):
+                    message.ack()
+                continue
+
+            _media_types = {"file_media_ingest", "file_media_embed"}
+            if batch_queue == _CLOUDFLARE_MEDIA_INGEST_QUEUE_NAME and str(payload.get("type", "")).strip() not in _media_types:
+                print(
+                    f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'media_queue.unexpected_payload', 'queue': batch_queue, 'payload_keys': list(payload.keys())}, ensure_ascii=False)}"
+                )
+                if hasattr(message, "ack"):
+                    message.ack()
+                continue
+
+            if str(payload.get("type", "")).strip() == "file_media_embed":
+                file_id = str(payload.get("file_id", "")).strip()
+                user_id = str(payload.get("user_id", "")).strip()
+                print(
+                    f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.start', 'kind': 'file_media_embed', 'file_id': file_id, 'attempts': getattr(message, 'attempts', None)}, ensure_ascii=False, default=str)}"
+                )
+                if not file_id or not user_id:
+                    print(
+                        f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'file_media_embed.invalid', 'payload': payload}, ensure_ascii=False, default=str)}"
+                    )
+                    if hasattr(message, "ack"):
+                        message.ack()
+                    continue
+                try:
+                    await container.file_service.process_queued_media_embed(user_id=user_id, file_id=file_id)
+                    print(f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.ok', 'kind': 'file_media_embed'}, ensure_ascii=False)}")
+                    if hasattr(message, "ack"):
+                        message.ack()
+                except Exception as exc:  # noqa: BLE001
+                    _full_error = _tb.format_exc()
+                    attempts = int(getattr(message, "attempts", 1) or 1)
+                    print(
+                        f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'file_media_embed.error', 'file_id': file_id, 'attempts': attempts, 'error': str(exc)}, ensure_ascii=False)}"
+                    )
+                    if attempts >= 3:
+                        await container.file_service.mark_media_ingest_failed(
+                            user_id=user_id,
+                            file_id=file_id,
+                            error_message=f"{exc}\n{_full_error}",
+                        )
+                        if hasattr(message, "ack"):
+                            message.ack()
+                    elif hasattr(message, "retry"):
+                        message.retry()
+                    elif hasattr(message, "ack"):
+                        message.ack()
+                continue
+
+            if str(payload.get("type", "")).strip() == "file_media_ingest":
+                file_id = str(payload.get("file_id", "")).strip()
+                user_id = str(payload.get("user_id", "")).strip()
+                print(
+                    f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.start', 'kind': 'file_media_ingest', 'file_id': file_id, 'attempts': getattr(message, 'attempts', None)}, ensure_ascii=False, default=str)}"
+                )
+                if not file_id or not user_id:
+                    print(
+                        f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'file_media_ingest.invalid', 'payload': payload}, ensure_ascii=False, default=str)}"
+                    )
+                    if hasattr(message, "ack"):
+                        message.ack()
+                    continue
+                try:
+                    await container.file_service.process_queued_media_ingest(user_id=user_id, file_id=file_id)
+                    print(f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.ok', 'kind': 'file_media_ingest'}, ensure_ascii=False)}")
+                    if hasattr(message, "ack"):
+                        message.ack()
+                except Exception as exc:  # noqa: BLE001
+                    _full_error = _tb.format_exc()
+                    attempts = int(getattr(message, "attempts", 1) or 1)
+                    print(
+                        f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'file_media_ingest.error', 'file_id': file_id, 'attempts': attempts, 'error': str(exc)}, ensure_ascii=False)}"
+                    )
+                    if attempts >= 3:
+                        await container.file_service.mark_media_ingest_failed(
+                            user_id=user_id,
+                            file_id=file_id,
+                            error_message=f"{exc}\n{_full_error}",
+                        )
+                        if hasattr(message, "ack"):
+                            message.ack()
+                    elif hasattr(message, "retry"):
+                        message.retry()
+                    elif hasattr(message, "ack"):
+                        message.ack()
+                continue
+
             try:
                 print(
                     f"[taskmate] {json.dumps({'scope': 'worker.queue', 'event': 'message.start', 'attempts': getattr(message, 'attempts', None)}, ensure_ascii=False, default=str)}"

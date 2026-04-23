@@ -14,6 +14,8 @@ from app.providers.llm_base import ChatProviderBase
 class IntentInterpretation:
     primary_intent: Intent
     task_action: TaskToolAction | None = None
+    file_action: str | None = None
+    file_answer_mode: str | None = None
     should_execute: bool = False
     needs_clarification: bool = False
     clarification_prompt: str | None = None
@@ -79,7 +81,7 @@ class LLMIntentInterpreter:
             "Return JSON only. Never explain. "
             "You decide whether the user's message should execute a write action now, "
             "ask a clarification question, answer from existing profile memory, start deep research, "
-            "answer against selected files, search the web, or continue as normal chat."
+            "answer against files, list uploaded files, search the web, or continue as normal chat."
         )
 
     def _build_prompt(
@@ -108,6 +110,8 @@ class LLMIntentInterpreter:
             "heuristic_hint": {
                 "primary_intent": fallback.primary_intent.value,
                 "task_action": fallback.task_action.value if fallback.task_action else None,
+                "file_action": fallback.file_action,
+                "file_answer_mode": fallback.file_answer_mode,
                 "task_title": fallback.task_title,
                 "target_ref": fallback.target_ref,
                 "profile_query_field": fallback.profile_query_field,
@@ -121,6 +125,8 @@ class LLMIntentInterpreter:
             "json_schema": {
                 "primary_intent": "collect_user_profile | task_crud | search_web | deep_research | file_qa | general_chat",
                 "task_action": "create_task | update_task | delete_task | get_task | list_tasks | null",
+                "file_action": "inventory | answer | null",
+                "file_answer_mode": "summary | compare | extract | qa | overview | null",
                 "should_execute": "boolean",
                 "needs_clarification": "boolean",
                 "clarification_prompt": "string | null",
@@ -146,7 +152,9 @@ class LLMIntentInterpreter:
                 "Never extract nonsense tails like 个 or 啥么 as real entities.",
                 "For task creation without a clear title, set should_execute=false and ask for the missing title.",
                 "For references like 这个任务 or 刚创建的任务, prefer target_ref=recent_task instead of inventing a title.",
-                "For selected-file questions, prefer primary_intent=file_qa.",
+                "For selected-file questions, prefer primary_intent=file_qa and set file_action=answer.",
+                "If the user asks to list or enumerate uploaded documents (有哪些文档/文件、上传了哪些、数据库里有什么资料), prefer primary_intent=file_qa and set file_action=inventory.",
+                "If the user asks to summarize/compare/extract/answer from files, set file_answer_mode accordingly.",
                 "For research requests like 调研/方案/tradeoff, prefer primary_intent=deep_research.",
                 "This interpreter is conservative fallback logic. Prefer preserving the heuristic result when uncertain.",
             ],
@@ -179,6 +187,8 @@ class LLMIntentInterpreter:
         interpretation = IntentInterpretation(
             primary_intent=primary_intent,
             task_action=task_action,
+            file_action=_parse_file_action(payload.get("file_action")) or fallback.file_action,
+            file_answer_mode=_parse_file_answer_mode(payload.get("file_answer_mode")) or fallback.file_answer_mode,
             should_execute=bool(payload.get("should_execute", fallback.should_execute)),
             needs_clarification=bool(payload.get("needs_clarification", fallback.needs_clarification)),
             clarification_prompt=_clean_optional_text(payload.get("clarification_prompt")) or fallback.clarification_prompt,
@@ -208,6 +218,11 @@ class LLMIntentInterpreter:
         if interpretation.profile_query_field or interpretation.assistant_query:
             interpretation.should_execute = False
             interpretation.needs_clarification = False
+        if interpretation.primary_intent == Intent.FILE_QA:
+            if not interpretation.file_action:
+                interpretation.file_action = fallback.file_action or "answer"
+            if interpretation.file_action == "answer" and not interpretation.file_answer_mode:
+                interpretation.file_answer_mode = fallback.file_answer_mode or "overview"
         if interpretation.task_action == TaskToolAction.CREATE and not interpretation.task_title:
             interpretation.should_execute = False
             interpretation.needs_clarification = True
@@ -253,9 +268,20 @@ class LLMIntentInterpreter:
                 confidence=0.95,
             )
 
+        if looks_like_file_inventory(message):
+            return IntentInterpretation(
+                primary_intent=Intent.FILE_QA,
+                file_action="inventory",
+                should_execute=True,
+                confidence=0.88,
+                explanation="file_inventory",
+            )
+
         if file_ids and "上传" not in message:
             return IntentInterpretation(
                 primary_intent=Intent.FILE_QA,
+                file_action="answer",
+                file_answer_mode=infer_file_answer_mode(message),
                 should_execute=True,
                 confidence=0.9,
                 explanation="selected_file_context",
@@ -277,6 +303,8 @@ class LLMIntentInterpreter:
         if _looks_like_file_question(message):
             return IntentInterpretation(
                 primary_intent=Intent.FILE_QA,
+                file_action="answer",
+                file_answer_mode=infer_file_answer_mode(message),
                 should_execute=True,
                 confidence=0.8,
                 explanation="file_question",
@@ -353,6 +381,18 @@ def _parse_task_action(value: object) -> TaskToolAction | None:
         return TaskToolAction(value)
     except ValueError:
         return None
+
+
+def _parse_file_action(value: object) -> str | None:
+    if isinstance(value, str) and value in {"inventory", "answer"}:
+        return value
+    return None
+
+
+def _parse_file_answer_mode(value: object) -> str | None:
+    if isinstance(value, str) and value in {"summary", "compare", "extract", "qa", "overview"}:
+        return value
+    return None
 
 
 def _parse_priority(value: object) -> TaskPriority | None:
@@ -436,6 +476,46 @@ def _asks_about_assistant_name(message: str) -> bool:
 def _looks_like_file_question(message: str) -> bool:
     lowered = message.lower()
     return any(keyword in message or keyword in lowered for keyword in FILE_KEYWORDS) and "上传" not in message
+
+
+def infer_file_answer_mode(message: str) -> str:
+    lowered = message.lower()
+    if any(keyword in lowered for keyword in ["对比", "比较", "区别", "compare", "comparison", "vs"]):
+        return "compare"
+    if any(keyword in lowered for keyword in ["提取", "列出", "清单", "字段", "表格", "extract", "list", "fields"]):
+        return "extract"
+    if any(
+        keyword in lowered
+        for keyword in ["介绍", "总结", "概括", "归纳", "评价", "分析", "介绍下", "summarize", "summary", "introduce", "overview", "analyze", "review"]
+    ):
+        return "summary"
+    if any(keyword in lowered for keyword in ["是什么", "为什么", "如何", "多少", "who", "what", "why", "how"]):
+        return "qa"
+    return "overview"
+
+
+def looks_like_file_inventory(message: str) -> bool:
+    """User wants a catalog of persisted uploads, not semantic QA over file contents."""
+    lowered = message.lower()
+    needles = (
+        "有哪些文档",
+        "有哪些文件",
+        "列出文档",
+        "列出文件",
+        "文档列表",
+        "文件列表",
+        "上传了哪些",
+        "我有哪些文件",
+        "我有哪些文档",
+        "查询数据库",
+        "数据库里",
+        "库里有哪些",
+        "知识库",
+        "indexed documents",
+        "list uploaded",
+        "list files",
+    )
+    return any(n in message or n.lower() in lowered for n in needles)
 
 
 def _detect_task_reference(message: str, task_call) -> str | None:

@@ -83,8 +83,10 @@ Research mode is now implemented as a durable queue-backed flow:
 1. Detect deep-research intent
 2. Build a small plan with 3 to 5 sub-steps
 3. Persist `research_jobs` and `research_job_states`
-4. Send the job into Cloudflare Queue
+4. Send the job into Cloudflare Queue (`taskmate-research-jobs`, binding `RESEARCH_QUEUE`)
 5. Let the queue consumer execute one sub-step at a time and write progress back to D1
+
+Video and other deferred media ingest messages go to a **separate** queue (`taskmate-media-ingest`, binding `MEDIA_INGEST_QUEUE`) so backlog or failures on research jobs do not block media processing, and operators can clear one queue independently.
 6. Poll the job state from the UI and render the final markdown report
 
 ## Queue and Durable Object assessment

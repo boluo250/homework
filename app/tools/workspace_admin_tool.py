@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.services.d1_repo import AppRepository
+from app.services.file_service import transcript_staging_object_key
 from app.state.file_state import FileState
 from app.state.research_state import ResearchState
 from app.state.task_state import TaskState
@@ -36,6 +37,11 @@ class WorkspaceAdminTool:
         for item in files:
             await self.qdrant_store.delete_by_file(user_id=user_id, file_id=item.id)
             await self.file_store.delete_file(item.r2_key)
+            bucket = getattr(self.file_store, "bucket_name", None) or "local-r2"
+            try:
+                await self.file_store.delete_file(f"r2://{bucket}/{transcript_staging_object_key(item.id)}")
+            except Exception:  # noqa: BLE001
+                pass
             removed = await self.file_state.delete_file(user_id, item.id)
             if removed is not None:
                 deleted += 1

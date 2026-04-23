@@ -217,7 +217,11 @@ dom.uploadForm.addEventListener("submit", async (event) => {
     if (!response.ok) {
       throw new Error(payload.error || "Upload failed");
     }
-    dom.uploadStatus.textContent = `解析与向量化完成：${payload.file.filename}，共切分 ${payload.chunk_count} 个片段，Qdrant 已写入 ${payload.vector_count} 条向量。`;
+    if (payload.ingest_status === "queued") {
+      dom.uploadStatus.textContent = `已保存 ${payload.file.filename}。视频转写与向量化在后台队列中处理（避免 Worker CPU 超时），请稍后刷新文件列表查看进度。`;
+    } else {
+      dom.uploadStatus.textContent = `解析与向量化完成：${payload.file.filename}，共切分 ${payload.chunk_count} 个片段，Qdrant 已写入 ${payload.vector_count} 条向量。`;
+    }
     dom.fileInput.value = "";
     await refreshFiles(payload.user_id);
     await loadFileDetails(payload.file.id, payload.user_id);

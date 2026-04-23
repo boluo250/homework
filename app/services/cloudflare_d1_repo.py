@@ -395,6 +395,22 @@ class CloudflareD1Repository(AppRepository):
             created_at=record.created_at,
         )
 
+    async def update_file_summary(self, user_id: str, file_id: str, *, summary: str | None) -> FileRecord | None:
+        record = await self.get_file(user_id, file_id)
+        if not record:
+            return None
+        await self._run("UPDATE files SET summary = ? WHERE id = ? AND user_id = ?", (summary, file_id, user_id))
+        return FileRecord(
+            id=record.id,
+            user_id=record.user_id,
+            filename=record.filename,
+            content_type=record.content_type,
+            size_bytes=record.size_bytes,
+            r2_key=record.r2_key,
+            summary=summary,
+            created_at=record.created_at,
+        )
+
     async def delete_file(self, user_id: str, file_id: str) -> FileRecord | None:
         record = await self.get_file(user_id, file_id)
         if not record:
