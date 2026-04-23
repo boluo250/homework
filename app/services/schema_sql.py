@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
   FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS conversation_task_drafts (
+  conversation_id TEXT PRIMARY KEY,
+  title TEXT,
+  details TEXT,
+  priority TEXT,
+  start_at TEXT,
+  end_at TEXT,
+  missing_json TEXT NOT NULL DEFAULT '[]',
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,
@@ -133,6 +145,7 @@ CREATE TABLE IF NOT EXISTS research_events (
 CREATE INDEX IF NOT EXISTS idx_users_client_id ON users(client_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_user_id_status ON tasks(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_created_at ON messages(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_conversation_task_drafts_updated_at ON conversation_task_drafts(updated_at);
 CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id);
 CREATE INDEX IF NOT EXISTS idx_research_jobs_user_id_status ON research_jobs(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_research_job_states_phase ON research_job_states(phase, updated_at);

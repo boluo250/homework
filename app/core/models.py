@@ -79,6 +79,21 @@ class ConversationSummary:
     updated_at: str = field(default_factory=utc_now_iso)
 
 
+@dataclass(slots=True)
+class PendingTaskDraftRecord:
+    conversation_id: str
+    title: str | None = None
+    details: str | None = None
+    priority: str | None = None
+    start_at: str | None = None
+    end_at: str | None = None
+    missing_fields: list[str] = field(default_factory=list)
+    updated_at: str = field(default_factory=utc_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class TaskStatus(str, Enum):
     TODO = "todo"
     IN_PROGRESS = "in_progress"
@@ -99,6 +114,8 @@ class TaskRecord:
     details: str = ""
     status: TaskStatus = TaskStatus.TODO
     priority: TaskPriority = TaskPriority.MEDIUM
+    start_at: str | None = None
+    end_at: str | None = None
     due_at: str | None = None
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)

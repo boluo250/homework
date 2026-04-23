@@ -51,3 +51,19 @@ def test_interpreter_marks_selected_file_compare_mode() -> None:
         assert result.file_answer_mode == "compare"
 
     asyncio.run(run())
+
+
+def test_interpreter_does_not_treat_project_task_discussion_as_user_todo() -> None:
+    async def run() -> None:
+        interpreter = LLMIntentInterpreter(InvalidJsonProvider())
+        result = await interpreter.interpret(
+            message="这个项目的任务拆解应该怎么设计？",
+            user=UserProfile(id="u3", client_id="c3"),
+            assistant_name="TaskMate",
+            recent_lines=[],
+            tasks=[],
+            file_ids=[],
+        )
+        assert result.primary_intent == Intent.GENERAL_CHAT
+
+    asyncio.run(run())

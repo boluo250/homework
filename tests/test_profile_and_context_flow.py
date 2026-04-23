@@ -167,12 +167,12 @@ def test_agent_accepts_call_me_phrase_and_uses_name_in_followup_reply(tmp_path) 
             ChatRequest(
                 client_id="client_profile_call_me",
                 conversation_id=first.conversation_id,
-                message='帮我创建一个"面试作业"任务',
+                message='帮我创建一个"面试作业"任务，开始日期 2026-04-24，结束日期 2026-04-30',
             )
         )
         assert second.user_profile is not None
         assert second.user_profile.name == "小李"
-        assert third.reply.startswith("小李，已创建任务")
+        assert third.reply.startswith("小李，已创建你的待办")
 
     asyncio.run(run())
 
@@ -236,6 +236,36 @@ def test_agent_does_not_create_task_with_generic_title(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_agent_asks_for_missing_start_or_end_date(tmp_path) -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        agent = AssistantAgent(
+            repository=repository,
+            chat_provider=OpenRouterChatProvider(),
+            search_service=SearchService(),
+            rag_service=RagService(
+                embedding_provider=RemoteEmbeddingProvider(),
+                qdrant_store=QdrantStore(storage_path=tmp_path / "vectors.json"),
+            ),
+        )
+        profile = await agent.handle_chat(
+            ChatRequest(client_id="client_missing_dates", message="我叫菠萝，我的邮箱是 bolo@example.com")
+        )
+        response = await agent.handle_chat(
+            ChatRequest(
+                client_id="client_missing_dates",
+                conversation_id=profile.conversation_id,
+                message='帮我创建一个"面试作业"任务，要求突出 Agent、RAG、Cloudflare Worker 项目经验，下周五前完成，高优先级',
+            )
+        )
+        user = await repository.get_or_create_user("client_missing_dates")
+        tasks = await repository.list_tasks(user.id)
+        assert "开始日期" in response.reply
+        assert not tasks
+
+    asyncio.run(run())
+
+
 def test_agent_answers_profile_query_without_overwriting_name(tmp_path) -> None:
     async def run() -> None:
         repository = InMemoryAppRepository()
@@ -284,14 +314,14 @@ def test_agent_can_delete_recent_task_by_generic_reference(tmp_path) -> None:
             ChatRequest(
                 client_id="client_delete_recent",
                 conversation_id=profile.conversation_id,
-                message='帮我创建一个"任务一"任务',
+                message='帮我创建一个"任务一"任务，开始日期 2026-04-24，结束日期 2026-04-25',
             )
         )
         await agent.handle_chat(
             ChatRequest(
                 client_id="client_delete_recent",
                 conversation_id=profile.conversation_id,
-                message='帮我创建一个"任务二"任务',
+                message='帮我创建一个"任务二"任务，开始日期 2026-04-26，结束日期 2026-04-27',
             )
         )
         deleted = await agent.handle_chat(
@@ -304,7 +334,7 @@ def test_agent_can_delete_recent_task_by_generic_reference(tmp_path) -> None:
         user = await repository.get_or_create_user("client_delete_recent")
         tasks = await repository.list_tasks(user.id)
         titles = [task.title for task in tasks]
-        assert "已删除任务：任务二" in deleted.reply
+        assert "已删除你的待办：任务二" in deleted.reply
         assert titles == ["任务一"]
 
     asyncio.run(run())

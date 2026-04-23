@@ -17,6 +17,8 @@ class TaskTool:
         title: str,
         details: str = "",
         priority: TaskPriority | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
         due_at: str | None = None,
     ):
         return await self.task_state.create_task(
@@ -24,6 +26,8 @@ class TaskTool:
             title=title,
             details=details,
             priority=priority,
+            start_at=start_at,
+            end_at=end_at,
             due_at=due_at,
         )
 
@@ -46,6 +50,8 @@ class TaskTool:
         details: str | None = None,
         status: TaskStatus | None = None,
         priority: TaskPriority | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
         due_at: str | None = None,
     ):
         return await self.task_state.update_task(
@@ -55,6 +61,8 @@ class TaskTool:
             details=details,
             status=status,
             priority=priority,
+            start_at=start_at,
+            end_at=end_at,
             due_at=due_at,
         )
 
@@ -77,6 +85,8 @@ class TaskTool:
         task_details: str | None,
         task_status: TaskStatus | None,
         task_priority: TaskPriority | None,
+        task_start_at: str | None,
+        task_end_at: str | None,
         task_due_at: str | None,
         target_ref: str | None,
     ) -> ToolOutcome:
@@ -86,11 +96,16 @@ class TaskTool:
                 title=task_title or "未命名任务",
                 details=task_details or "",
                 priority=task_priority,
+                start_at=task_start_at,
+                end_at=task_end_at,
                 due_at=task_due_at,
             )
             details_suffix = f"，需求：{task.details}" if task.details else ""
             return ToolOutcome(
-                reply=f"已创建任务：{task.title}，优先级 {task.priority.value}，状态 {task.status.value}{details_suffix}。",
+                reply=(
+                    f"已创建你的待办：{task.title}，优先级 {task.priority.value}，状态 {task.status.value}"
+                    f"{_task_schedule_suffix(task)}{details_suffix}。"
+                ),
                 tool_results=[ToolResult(name=TaskToolAction.CREATE.value, ok=True, content=task.to_dict())],
             )
         if action == TaskToolAction.UPDATE:
@@ -107,6 +122,8 @@ class TaskTool:
                 details=task_details,
                 status=task_status,
                 priority=task_priority,
+                start_at=task_start_at,
+                end_at=task_end_at,
                 due_at=task_due_at,
             )
             if not updated:
@@ -116,7 +133,10 @@ class TaskTool:
                 )
             details_suffix = f"，需求：{updated.details}" if updated.details else ""
             return ToolOutcome(
-                reply=f"任务已更新：{updated.title}，状态 {updated.status.value}，优先级 {updated.priority.value}{details_suffix}。",
+                reply=(
+                    f"任务已更新：{updated.title}，状态 {updated.status.value}，优先级 {updated.priority.value}"
+                    f"{_task_schedule_suffix(updated)}{details_suffix}。"
+                ),
                 tool_results=[ToolResult(name=TaskToolAction.UPDATE.value, ok=True, content=updated.to_dict())],
             )
         if action == TaskToolAction.DELETE:
@@ -133,7 +153,7 @@ class TaskTool:
                     tool_results=[ToolResult(name=TaskToolAction.DELETE.value, ok=False, content={"target_ref": target_ref})],
                 )
             return ToolOutcome(
-                reply=f"已删除任务：{task.title if task else task_title or '目标任务'}。",
+                reply=f"已删除你的待办：{task.title if task else task_title or '目标任务'}。",
                 tool_results=[ToolResult(name=TaskToolAction.DELETE.value, ok=True, content=task.to_dict() if task else {})],
             )
         if action == TaskToolAction.GET:
@@ -150,10 +170,11 @@ class TaskTool:
                 )
             details = task.details or "暂无具体需求"
             reply = (
-                f"任务详情：{task.title}\n"
+                f"待办详情：{task.title}\n"
                 f"- 状态：{task.status.value}\n"
                 f"- 优先级：{task.priority.value}\n"
-                f"- 截止时间：{task.due_at or '未设置'}\n"
+                f"- 开始日期：{task.start_at or '未设置'}\n"
+                f"- 结束日期：{task.end_at or task.due_at or '未设置'}\n"
                 f"- 具体需求：{details}"
             )
             return ToolOutcome(
@@ -163,16 +184,16 @@ class TaskTool:
         tasks = await self.list(user_id)
         if not tasks:
             return ToolOutcome(
-                reply="你现在还没有任务，我可以直接帮你创建一个。",
+                reply="你现在还没有自己创建的待办，我可以直接帮你记一个。",
                 tool_results=[ToolResult(name=TaskToolAction.LIST.value, ok=True, content=[])],
             )
         lines = [
-            f"- {task.title} | status={task.status.value} | priority={task.priority.value} | due={task.due_at or 'n/a'}"
+            f"- {task.title} | status={task.status.value} | priority={task.priority.value} | start={task.start_at or 'n/a'} | end={task.end_at or task.due_at or 'n/a'}"
             + (f" | details={task.details}" if task.details else "")
             for task in tasks
         ]
         return ToolOutcome(
-            reply="当前任务如下：\n" + "\n".join(lines),
+            reply="你当前自己创建的待办如下：\n" + "\n".join(lines),
             tool_results=[ToolResult(name=TaskToolAction.LIST.value, ok=True, content=[task.to_dict() for task in tasks])],
         )
 
@@ -206,3 +227,15 @@ class TaskTool:
                 item[0],
             ),
         )[1]
+
+
+def _task_schedule_suffix(task) -> str:
+    start = getattr(task, "start_at", None)
+    end = getattr(task, "end_at", None) or getattr(task, "due_at", None)
+    if start and end:
+        return f"，开始 {start}，结束 {end}"
+    if start:
+        return f"，开始 {start}"
+    if end:
+        return f"，结束 {end}"
+    return ""

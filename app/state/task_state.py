@@ -15,6 +15,8 @@ class TaskState:
         title: str,
         details: str = "",
         priority: TaskPriority | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
         due_at: str | None = None,
     ) -> TaskRecord:
         return await self.repository.create_task(
@@ -22,6 +24,8 @@ class TaskState:
             title=title,
             details=details,
             priority=priority,
+            start_at=start_at,
+            end_at=end_at,
             due_at=due_at,
         )
 
@@ -43,6 +47,8 @@ class TaskState:
         details: str | None = None,
         status: TaskStatus | None = None,
         priority: TaskPriority | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
         due_at: str | None = None,
     ) -> TaskRecord | None:
         return await self.repository.update_task(
@@ -52,6 +58,8 @@ class TaskState:
             details=details,
             status=status,
             priority=priority,
+            start_at=start_at,
+            end_at=end_at,
             due_at=due_at,
         )
 

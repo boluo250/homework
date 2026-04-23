@@ -9,6 +9,7 @@ from app.core.models import (
     ConversationSummary,
     FileRecord,
     MessageRole,
+    PendingTaskDraftRecord,
     ResearchEvent,
     ResearchJob,
     ResearchJobState,
@@ -229,6 +230,56 @@ class CloudflareD1Repository(AppRepository):
         )
         return payload
 
+    async def get_pending_task_draft(self, conversation_id: str) -> PendingTaskDraftRecord | None:
+        await self._ensure_schema()
+        row = await self._first("SELECT * FROM conversation_task_drafts WHERE conversation_id = ?", (conversation_id,))
+        return _row_to_pending_task_draft(row) if row else None
+
+    async def save_pending_task_draft(
+        self,
+        conversation_id: str,
+        *,
+        title: str | None = None,
+        details: str | None = None,
+        priority: str | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
+        missing_fields: list[str] | None = None,
+    ) -> PendingTaskDraftRecord:
+        await self._ensure_schema()
+        updated_at = utc_now_iso()
+        missing_json = __import__("json").dumps(list(missing_fields or []), ensure_ascii=False)
+        await self._run(
+            """
+            INSERT INTO conversation_task_drafts
+            (conversation_id, title, details, priority, start_at, end_at, missing_json, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+              title = excluded.title,
+              details = excluded.details,
+              priority = excluded.priority,
+              start_at = excluded.start_at,
+              end_at = excluded.end_at,
+              missing_json = excluded.missing_json,
+              updated_at = excluded.updated_at
+            """,
+            (conversation_id, title, details, priority, start_at, end_at, missing_json, updated_at),
+        )
+        return PendingTaskDraftRecord(
+            conversation_id=conversation_id,
+            title=title,
+            details=details,
+            priority=priority,
+            start_at=start_at,
+            end_at=end_at,
+            missing_fields=list(missing_fields or []),
+            updated_at=updated_at,
+        )
+
+    async def clear_pending_task_draft(self, conversation_id: str) -> None:
+        await self._ensure_schema()
+        await self._run("DELETE FROM conversation_task_drafts WHERE conversation_id = ?", (conversation_id,))
+
     async def create_task(
         self,
         user_id: str,
@@ -236,6 +287,8 @@ class CloudflareD1Repository(AppRepository):
         title: str,
         details: str = "",
         priority: TaskPriority | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
         due_at: str | None = None,
     ) -> TaskRecord:
         await self._ensure_schema()
@@ -245,13 +298,15 @@ class CloudflareD1Repository(AppRepository):
             title=title,
             details=details,
             priority=priority or TaskPriority.MEDIUM,
-            due_at=due_at,
+            start_at=start_at,
+            end_at=end_at or due_at,
+            due_at=end_at or due_at,
         )
         await self._run(
             """
             INSERT INTO tasks
-            (id, user_id, title, details, status, priority, due_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, user_id, title, details, status, priority, start_at, end_at, due_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.id,
@@ -260,6 +315,8 @@ class CloudflareD1Repository(AppRepository):
                 payload.details,
                 payload.status.value,
                 payload.priority.value,
+                payload.start_at,
+                payload.end_at,
                 payload.due_at,
                 payload.created_at,
                 payload.updated_at,
@@ -288,9 +345,12 @@ class CloudflareD1Repository(AppRepository):
         *,
         task_id: str | None = None,
         title_hint: str | None = None,
+        title: str | None = None,
         details: str | None = None,
         status: TaskStatus | None = None,
         priority: TaskPriority | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
         due_at: str | None = None,
     ) -> TaskRecord | None:
         task = await self.get_task(user_id, task_id) if task_id else None
@@ -299,21 +359,31 @@ class CloudflareD1Repository(AppRepository):
         if not task:
             return None
         updated_at = utc_now_iso()
+        next_title = task.title if title is None else title
         next_details = task.details if details is None else details
         next_status = status or task.status
         next_priority = priority or task.priority
-        next_due_at = task.due_at if due_at is None else due_at
+        next_start_at = task.start_at if start_at is None else start_at
+        next_end_at = task.end_at if end_at is None else end_at
+        if due_at is not None:
+            next_end_at = due_at
+        next_due_at = next_end_at if next_end_at is not None else task.due_at
         await self._run(
-            "UPDATE tasks SET details = ?, status = ?, priority = ?, due_at = ?, updated_at = ? WHERE id = ?",
-            (next_details, next_status.value, next_priority.value, next_due_at, updated_at, task.id),
+            (
+                "UPDATE tasks SET title = ?, details = ?, status = ?, priority = ?, start_at = ?, end_at = ?, due_at = ?, updated_at = ? "
+                "WHERE id = ?"
+            ),
+            (next_title, next_details, next_status.value, next_priority.value, next_start_at, next_end_at, next_due_at, updated_at, task.id),
         )
         return TaskRecord(
             id=task.id,
             user_id=task.user_id,
-            title=task.title,
+            title=next_title,
             details=next_details,
             status=next_status,
             priority=next_priority,
+            start_at=next_start_at,
+            end_at=next_end_at,
             due_at=next_due_at,
             created_at=task.created_at,
             updated_at=updated_at,
@@ -736,6 +806,7 @@ class CloudflareD1Repository(AppRepository):
         await self._ensure_schema()
         for table in (
             "messages",
+            "conversation_task_drafts",
             "conversation_summaries",
             "conversations",
             "assistant_settings",
@@ -754,7 +825,18 @@ class CloudflareD1Repository(AppRepository):
             return
         for statement in _split_migration_statements(self.migrations_sql):
             await self._run(statement)
+        await self._ensure_task_columns()
         self._schema_ready = True
+
+    async def _ensure_task_columns(self) -> None:
+        row = await self._first("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
+        sql = str((row or {}).get("sql", "")).lower()
+        for name in ("start_at", "end_at"):
+            if name not in sql:
+                try:
+                    await self._run(f"ALTER TABLE tasks ADD COLUMN {name} TEXT")
+                except Exception:
+                    pass
 
     async def _run(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
         statement = self.db.prepare(sql)
@@ -862,7 +944,31 @@ def _row_to_summary(row: dict[str, Any]) -> ConversationSummary:
     )
 
 
+def _row_to_pending_task_draft(row: dict[str, Any]) -> PendingTaskDraftRecord:
+    missing_fields: list[str] = []
+    raw_missing = row.get("missing_json")
+    if raw_missing:
+        try:
+            parsed = __import__("json").loads(raw_missing)
+        except Exception:
+            parsed = []
+        if isinstance(parsed, list):
+            missing_fields = [str(item) for item in parsed if str(item).strip()]
+    return PendingTaskDraftRecord(
+        conversation_id=row["conversation_id"],
+        title=row.get("title"),
+        details=row.get("details"),
+        priority=row.get("priority"),
+        start_at=row.get("start_at"),
+        end_at=row.get("end_at"),
+        missing_fields=missing_fields,
+        updated_at=row["updated_at"],
+    )
+
+
 def _row_to_task(row: dict[str, Any]) -> TaskRecord:
+    end_at = row.get("end_at")
+    due_at = row.get("due_at")
     return TaskRecord(
         id=row["id"],
         user_id=row["user_id"],
@@ -870,7 +976,9 @@ def _row_to_task(row: dict[str, Any]) -> TaskRecord:
         details=row["details"],
         status=TaskStatus(row["status"]),
         priority=TaskPriority(row["priority"]),
-        due_at=row.get("due_at"),
+        start_at=row.get("start_at"),
+        end_at=end_at or due_at,
+        due_at=due_at or end_at,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

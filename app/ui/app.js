@@ -598,7 +598,7 @@ function syncComposerPlaceholder() {
     dom.messageInput.placeholder = `先告诉我你的${missing.join("和")}，例如：我叫小李，邮箱是 xiaoli@example.com`;
     return;
   }
-  dom.messageInput.placeholder = `${state.userProfile.name}，试试：帮我创建一个“简历优化”任务，下周五前完成，高优先级`;
+  dom.messageInput.placeholder = `${state.userProfile.name}，试试：帮我创建一个我的待办“简历优化”，下周五前完成，高优先级`;
 }
 
 function buildBootstrapMessage() {
@@ -606,7 +606,7 @@ function buildBootstrapMessage() {
   if (missing.length > 0) {
     return `你好，我是 ${state.assistantName}。开始之前，先告诉我你的${missing.join("和")}，我会先记下来，后续就能稳定称呼你。`;
   }
-  return `你好，${state.userProfile.name}，我是 ${state.assistantName}。你的名字和邮箱我已经记住了，可以继续创建任务、上传文件，或者直接发起研究。`;
+  return `你好，${state.userProfile.name}，我是 ${state.assistantName}。你的名字和邮箱我已经记住了，可以继续创建你的待办、上传文件，或者直接发起研究。`;
 }
 
 function missingProfileFields(profile) {
@@ -705,7 +705,7 @@ function pendingChatLabel(message) {
   if (/研究|调研|对比|方案|报告|分析/.test(message)) {
     return "正在准备研究计划";
   }
-  if (/任务|待办|todo|提醒/.test(lowered) || /任务|待办|提醒/.test(message)) {
+  if (/我的任务|我的待办|待办|提醒我|帮我创建|给我记/.test(message) || /todo/.test(lowered)) {
     return "正在处理任务请求";
   }
   return "正在思考";

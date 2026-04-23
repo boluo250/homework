@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from app.core.intents import FILE_KEYWORDS, RESEARCH_KEYWORDS, SEARCH_KEYWORDS, TASK_KEYWORDS
+from app.core.intents import FILE_KEYWORDS, RESEARCH_KEYWORDS, SEARCH_KEYWORDS, looks_like_user_task_request
 from app.core.models import Intent, TaskPriority, TaskStatus, UserProfile
 from app.core.task_protocol import TaskToolAction, is_generic_task_reference, parse_task_tool_call
 from app.providers.llm_base import ChatProviderBase
@@ -24,6 +24,8 @@ class IntentInterpretation:
     task_title: str | None = None
     task_details: str | None = None
     task_priority: TaskPriority | None = None
+    task_start_at: str | None = None
+    task_end_at: str | None = None
     task_due_at: str | None = None
     task_status: TaskStatus | None = None
     user_name: str | None = None
@@ -135,6 +137,8 @@ class LLMIntentInterpreter:
                 "task_title": "string | null",
                 "task_details": "string | null",
                 "task_priority": "high | medium | low | null",
+                "task_start_at": "string | null",
+                "task_end_at": "string | null",
                 "task_due_at": "string | null",
                 "task_status": "todo | in_progress | done | null",
                 "user_name": "string | null",
@@ -197,6 +201,8 @@ class LLMIntentInterpreter:
             task_title=task_title or fallback.task_title,
             task_details=_clean_optional_text(payload.get("task_details")) or fallback.task_details,
             task_priority=_parse_priority(payload.get("task_priority")) or fallback.task_priority,
+            task_start_at=_clean_optional_text(payload.get("task_start_at")) or fallback.task_start_at,
+            task_end_at=_clean_optional_text(payload.get("task_end_at")) or fallback.task_end_at,
             task_due_at=_clean_optional_text(payload.get("task_due_at")) or fallback.task_due_at,
             task_status=_parse_status(payload.get("task_status")) or fallback.task_status,
             user_name=_clean_optional_text(payload.get("user_name")) or fallback.user_name,
@@ -227,6 +233,12 @@ class LLMIntentInterpreter:
             interpretation.should_execute = False
             interpretation.needs_clarification = True
             interpretation.clarification_prompt = interpretation.clarification_prompt or "可以，我先帮你建任务。这个任务想叫什么？"
+        if interpretation.task_action == TaskToolAction.CREATE and interpretation.task_title:
+            missing = _missing_task_schedule_fields(interpretation.task_start_at, interpretation.task_end_at)
+            if missing:
+                interpretation.should_execute = False
+                interpretation.needs_clarification = True
+                interpretation.clarification_prompt = _build_task_schedule_clarification(missing)
         if interpretation.task_action in {TaskToolAction.UPDATE, TaskToolAction.DELETE, TaskToolAction.GET}:
             if not interpretation.task_title and not interpretation.target_ref:
                 interpretation.should_execute = False
@@ -331,13 +343,16 @@ class LLMIntentInterpreter:
                 explanation="profile_or_nickname_update",
             )
 
-        if _matches_any(lowered, TASK_KEYWORDS) or task_call.action != TaskToolAction.LIST:
+        task_like_message = task_call.action != TaskToolAction.LIST or looks_like_user_task_request(message)
+        if task_like_message:
             interpretation = IntentInterpretation(
                 primary_intent=Intent.TASK_CRUD,
                 task_action=task_call.action,
                 task_title=task_call.title,
                 task_details=task_call.details,
                 task_priority=task_call.priority,
+                task_start_at=task_call.start_at,
+                task_end_at=task_call.end_at,
                 task_due_at=task_call.due_at,
                 task_status=task_call.status,
                 target_ref=target_ref,
@@ -349,6 +364,12 @@ class LLMIntentInterpreter:
                 interpretation.needs_clarification = not interpretation.should_execute
                 if interpretation.needs_clarification:
                     interpretation.clarification_prompt = "可以，我先帮你建任务。这个任务想叫什么？"
+                else:
+                    missing = _missing_task_schedule_fields(task_call.start_at, task_call.end_at)
+                    if missing:
+                        interpretation.should_execute = False
+                        interpretation.needs_clarification = True
+                        interpretation.clarification_prompt = _build_task_schedule_clarification(missing)
             elif task_call.action == TaskToolAction.LIST:
                 interpretation.should_execute = True
             else:
@@ -417,6 +438,23 @@ def _parse_confidence(value: object, fallback: float) -> float:
     if isinstance(value, (int, float)):
         return max(0.0, min(float(value), 1.0))
     return fallback
+
+
+def _missing_task_schedule_fields(start_at: str | None, end_at: str | None) -> list[str]:
+    missing: list[str] = []
+    if not start_at:
+        missing.append("start_at")
+    if not end_at:
+        missing.append("end_at")
+    return missing
+
+
+def _build_task_schedule_clarification(missing: list[str]) -> str:
+    if missing == ["start_at", "end_at"]:
+        return "可以，我先帮你建这个待办。开始日期和结束日期分别是什么？"
+    if missing == ["start_at"]:
+        return "可以，我先帮你建这个待办。开始日期是什么？"
+    return "可以，我先帮你建这个待办。结束日期是什么？"
 
 
 def _clean_optional_text(value: object) -> str | None:

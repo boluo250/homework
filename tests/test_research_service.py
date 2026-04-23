@@ -13,7 +13,8 @@ from app.services.research_service import ResearchService
 
 
 class FakeSearchService:
-    async def search(self, query: str) -> list[dict]:
+    async def search(self, query: str, limit: int | None = None) -> list[dict]:
+        _ = limit
         return [
             {
                 "title": f"{query} result A",

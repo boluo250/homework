@@ -49,13 +49,15 @@ class ToolRegistry:
             ),
             ToolDefinition(
                 name=TaskToolAction.CREATE.value,
-                description="Create a task with a concrete title and optional details, priority, and due date.",
+                description="Create a task with a concrete title, start date, end date, and optional details or priority.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "title": {"type": "string"},
                         "details": {"type": "string"},
                         "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                        "start_at": {"type": "string"},
+                        "end_at": {"type": "string"},
                         "due_at": {"type": "string"},
                     },
                     "required": ["title"],
@@ -73,6 +75,8 @@ class ToolRegistry:
                         "details": {"type": "string"},
                         "status": {"type": "string", "enum": ["todo", "in_progress", "done"]},
                         "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                        "start_at": {"type": "string"},
+                        "end_at": {"type": "string"},
                         "due_at": {"type": "string"},
                     },
                     "additionalProperties": False,

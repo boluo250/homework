@@ -20,7 +20,8 @@ from app.services.research_service import ResearchService
 
 
 class DemoSearchService:
-    async def search(self, query: str) -> list[dict]:
+    async def search(self, query: str, limit: int | None = None) -> list[dict]:
+        _ = limit
         return [
             {
                 "title": f"{query} - 官方概览",
@@ -47,7 +48,10 @@ class DemoWebFetchService:
 class DemoAgentChatProvider(ChatProviderBase):
     async def chat(self, *, system_prompt: str, user_message: str) -> str:
         if "file question-answering assistant" in system_prompt:
-            return "这份资料主要围绕 Agent、RAG、Cloudflare Worker 交付经验展开，适合用来支撑简历和项目说明。"
+            return (
+                "这份资料主要围绕 Agent、RAG、Cloudflare Worker 交付经验展开，适合用来支撑简历和项目说明。\n"
+                "EVIDENCE_IDS: [1]"
+            )
         return "这是一个本地演示回答，用于验证端到端链路。"
 
 
@@ -115,10 +119,10 @@ def test_demo_e2e_chat_task_and_search_flow(tmp_path: Path) -> None:
         created = await chat(
             container,
             client_id,
-            '帮我创建一个"面试作业"任务，要求突出 Agent、RAG、Cloudflare Worker 项目经验，下周五前完成，高优先级',
+            '帮我创建一个"面试作业"任务，要求突出 Agent、RAG、Cloudflare Worker 项目经验，开始日期 2026-04-24，结束日期 2026-04-30，高优先级',
             conversation_id=profile["conversation_id"],
         )
-        assert "已创建任务" in created["reply"]
+        assert "已创建你的待办" in created["reply"]
         assert "需求" in created["reply"]
 
         listed = await chat(container, client_id, "列出我的任务", conversation_id=profile["conversation_id"])
@@ -131,7 +135,7 @@ def test_demo_e2e_chat_task_and_search_flow(tmp_path: Path) -> None:
             '看看"面试作业"任务的具体需求',
             conversation_id=profile["conversation_id"],
         )
-        assert "任务详情" in task_detail["reply"]
+        assert "待办详情" in task_detail["reply"]
         assert "Cloudflare Worker 项目经验" in task_detail["reply"]
 
         search_result = await chat(
@@ -314,7 +318,7 @@ def test_demo_e2e_admin_reset_clears_workspace_data(tmp_path: Path) -> None:
         await chat(
             container,
             client_id,
-            '帮我创建一个"清空测试"任务，要求验证 reset 接口',
+            '帮我创建一个"清空测试"任务，要求验证 reset 接口，开始日期 2026-04-24，结束日期 2026-04-25',
             conversation_id=profile["conversation_id"],
         )
         await request_json(

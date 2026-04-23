@@ -32,10 +32,10 @@
 
         <section class="panel">
           <div class="panel-header">
-            <h2>任务列表</h2>
+            <h2>我的待办</h2>
             <button id="refreshTasksButton" class="ghost-button">刷新</button>
           </div>
-          <p class="section-note">统一查看当前用户上下文下的待办、优先级和截止信息。</p>
+          <p class="section-note">这里只展示当前用户自己创建的待办，不包含项目内部的开发任务或系统任务。</p>
           <div id="taskList" class="stack empty-state">还没有任务</div>
         </section>
 
@@ -112,7 +112,7 @@
               id="messageInput"
               name="message"
               rows="3"
-              placeholder="试试：帮我创建一个“简历优化”任务，下周五前完成，高优先级"
+              placeholder="试试：帮我创建一个我的待办“简历优化”，下周五前完成，高优先级"
             ></textarea>
             <div class="composer-footer">
               <div class="composer-meta">

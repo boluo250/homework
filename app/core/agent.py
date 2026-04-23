@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 from app.core.intent_interpreter import IntentInterpretation, LLMIntentInterpreter
-from app.services.file_service import MEDIA_INGEST_STAGING_PREFIX
-from app.core.models import ChatRequest, ChatResponse, Intent, TaskPriority, TaskStatus, ToolResult
-from app.core.task_protocol import TaskToolAction, is_generic_task_reference
+from app.core.models import ChatRequest, ChatResponse, Intent, PendingTaskDraftRecord, TaskPriority, TaskStatus, ToolResult
+from app.core.task_slot_extractor import ExtractedTaskSlots, TaskSlotExtractor
+from app.core.task_protocol import TaskToolAction, extract_task_schedule_fields, is_generic_task_reference, parse_task_tool_call
 from app.providers.llm_base import ChatProviderBase, ToolCall, ToolDefinition
 from app.runtime.prompt_builder import build_chat_system_prompt, build_file_qa_prompt_bundle, build_tool_router_prompt
 from app.runtime.session_context import ConversationContextManager
 from app.runtime.skills_loader import SkillsLoader
 from app.runtime.tool_registry import ToolRegistry
+from app.services.file_service import MEDIA_INGEST_STAGING_PREFIX
 from app.services.d1_repo import AppRepository
 from app.services.memory_service import MemoryService
 from app.services.rag_service import RagService
@@ -52,6 +54,7 @@ class AssistantAgent:
         self.memory_service = memory_service
         self.context_manager = context_manager or ConversationContextManager()
         self.intent_interpreter = LLMIntentInterpreter(chat_provider)
+        self.task_slot_extractor = TaskSlotExtractor(chat_provider)
         self.user_state = UserState(repository)
         self.assistant_state = AssistantState(repository)
         self.task_state = TaskState(repository)
@@ -81,6 +84,7 @@ class AssistantAgent:
         messages = await self.repository.list_messages(conversation.id)
         summary = await self.repository.get_summary(conversation.id)
         context_bundle = self.context_manager.build(messages, summary)
+        pending_task_draft = await self.repository.get_pending_task_draft(conversation.id)
         if context_bundle.should_refresh_summary and context_bundle.summary_text:
             await self.repository.save_summary(
                 conversation.id,
@@ -89,7 +93,11 @@ class AssistantAgent:
             )
 
         tasks = await self.repository.list_tasks(user.id)
-        if self.chat_provider.supports_tool_calls():
+        should_bypass_tool_router = pending_task_draft is not None and _looks_like_pending_task_reply(
+            request.message,
+            pending_task_draft,
+        )
+        if self.chat_provider.supports_tool_calls() and not should_bypass_tool_router:
             outcome = await self._handle_tool_routed_turn(
                 request=request,
                 user=user,
@@ -97,6 +105,7 @@ class AssistantAgent:
                 context_bundle=context_bundle,
                 tasks=tasks,
                 profile_was_incomplete=profile_was_incomplete,
+                pending_task_draft=pending_task_draft,
             )
         else:
             outcome = await self._handle_interpreted_turn(
@@ -106,6 +115,7 @@ class AssistantAgent:
                 context_bundle=context_bundle,
                 tasks=tasks,
                 profile_was_incomplete=profile_was_incomplete,
+                pending_task_draft=pending_task_draft,
             )
 
         user = outcome["user"]
@@ -113,6 +123,8 @@ class AssistantAgent:
         intent = outcome["intent"]
         tool_results = outcome["tool_results"]
         reply = outcome["reply"]
+
+        await self._sync_pending_task_draft(conversation.id, tool_results)
 
         reply = self._personalize_reply(reply, user.name, intent=intent)
 
@@ -147,6 +159,22 @@ class AssistantAgent:
             "assistant_name": settings.bot_name,
         }
 
+    async def _sync_pending_task_draft(self, conversation_id: str, tool_results: list[ToolResult]) -> None:
+        pending = _pending_task_draft_from_tool_results(conversation_id, tool_results)
+        if pending is not None:
+            await self.repository.save_pending_task_draft(
+                conversation_id,
+                title=pending.title,
+                details=pending.details,
+                priority=pending.priority,
+                start_at=pending.start_at,
+                end_at=pending.end_at,
+                missing_fields=pending.missing_fields,
+            )
+            return
+        if any(result.name == TaskToolAction.CREATE.value and result.ok for result in tool_results):
+            await self.repository.clear_pending_task_draft(conversation_id)
+
     async def _handle_tool_routed_turn(
         self,
         *,
@@ -156,6 +184,7 @@ class AssistantAgent:
         context_bundle,
         tasks: list,
         profile_was_incomplete: bool,
+        pending_task_draft: PendingTaskDraftRecord | None,
     ) -> dict[str, Any]:
         tool_response = await self.chat_provider.chat_with_tools(
             system_prompt=self._build_tool_router_prompt(
@@ -179,6 +208,7 @@ class AssistantAgent:
                 context_bundle=context_bundle,
                 tasks=tasks,
                 profile_was_incomplete=profile_was_incomplete,
+                pending_task_draft=pending_task_draft,
             )
 
         if not tool_response.tool_calls:
@@ -197,6 +227,7 @@ class AssistantAgent:
                 context_bundle=context_bundle,
                 tasks=tasks,
                 profile_was_incomplete=profile_was_incomplete,
+                pending_task_draft=pending_task_draft,
             )
 
         primary_intent = Intent.GENERAL_CHAT
@@ -272,6 +303,9 @@ class AssistantAgent:
                     current_intent=primary_intent,
                     user=user,
                     assistant_name=settings.bot_name,
+                    pending_task_draft=pending_task_draft,
+                    tasks=tasks,
+                    recent_lines=context_bundle.recent_lines,
                 )
                 reply_parts.append(task_reply)
                 tool_results.extend(task_tool_results)
@@ -362,6 +396,7 @@ class AssistantAgent:
         context_bundle,
         tasks: list,
         profile_was_incomplete: bool,
+        pending_task_draft: PendingTaskDraftRecord | None,
     ) -> dict[str, Any]:
         interpretation = await self.intent_interpreter.interpret(
             message=request.message,
@@ -370,6 +405,13 @@ class AssistantAgent:
             recent_lines=context_bundle.recent_lines,
             tasks=tasks,
             file_ids=request.file_ids,
+        )
+        interpretation = await self._apply_task_create_slot_filling(
+            interpretation,
+            message=request.message,
+            pending_task_draft=pending_task_draft,
+            recent_lines=context_bundle.recent_lines,
+            tasks=tasks,
         )
 
         bot_name_updated = False
@@ -403,6 +445,7 @@ class AssistantAgent:
             reply = self.profile_tool.build_saved_reply(user, settings.bot_name, bot_name_updated=bot_name_updated)
         elif interpretation.needs_clarification and interpretation.clarification_prompt:
             reply = interpretation.clarification_prompt
+            tool_results = _pending_task_tool_results(interpretation)
         elif intent == Intent.TASK_CRUD:
             reply, tool_results = await self._handle_task_intent(user.id, interpretation)
         elif intent == Intent.SEARCH_WEB:
@@ -498,6 +541,9 @@ class AssistantAgent:
         current_intent: Intent,
         user,
         assistant_name: str,
+        pending_task_draft: PendingTaskDraftRecord | None,
+        tasks: list,
+        recent_lines: list[str],
     ) -> tuple[str, list[ToolResult], Intent]:
         if user.needs_profile_completion:
             return (
@@ -506,28 +552,88 @@ class AssistantAgent:
                 self._merge_primary_intent(current_intent, Intent.TASK_CRUD),
             )
 
-        title = _normalize_tool_task_title(args.get("title"))
-        target_ref = _normalize_tool_target_ref(args.get("target_ref"), raw_title=_clean_tool_text(args.get("title")))
-        interpretation = IntentInterpretation(
-            primary_intent=Intent.TASK_CRUD,
-            task_action=TaskToolAction(tool_name),
-            should_execute=True,
-            task_title=title,
-            task_details=_clean_tool_text(args.get("details")),
-            task_priority=_parse_tool_priority(args.get("priority")),
-            task_due_at=_clean_tool_text(args.get("due_at")),
-            task_status=_parse_tool_status(args.get("status")),
-            target_ref=target_ref,
-        )
+        action = TaskToolAction(tool_name)
+        if action == TaskToolAction.CREATE:
+            interpretation = await self._apply_task_create_slot_filling(
+                IntentInterpretation(
+                    primary_intent=Intent.TASK_CRUD,
+                    task_action=TaskToolAction.CREATE,
+                    should_execute=True,
+                    task_title=_normalize_tool_task_title(args.get("title")),
+                    task_details=_clean_tool_text(args.get("details")),
+                    task_priority=_parse_tool_priority(args.get("priority")),
+                ),
+                message=message,
+                pending_task_draft=pending_task_draft,
+                recent_lines=recent_lines,
+                tasks=tasks,
+            )
+        else:
+            title = _normalize_tool_task_title(args.get("title"))
+            target_ref = _normalize_tool_target_ref(args.get("target_ref"), raw_title=_clean_tool_text(args.get("title")))
+            interpretation = IntentInterpretation(
+                primary_intent=Intent.TASK_CRUD,
+                task_action=action,
+                should_execute=True,
+                task_title=title,
+                task_details=_clean_tool_text(args.get("details")),
+                task_priority=_parse_tool_priority(args.get("priority")),
+                task_start_at=_clean_tool_text(args.get("start_at")),
+                task_end_at=_clean_tool_text(args.get("end_at")),
+                task_due_at=_clean_tool_text(args.get("due_at")),
+                task_status=_parse_tool_status(args.get("status")),
+                target_ref=target_ref,
+            )
+            interpretation = _merge_pending_task_interpretation(
+                interpretation,
+                message=message,
+                pending_task_draft=pending_task_draft,
+            )
         if interpretation.task_action == TaskToolAction.CREATE and not interpretation.task_title:
             return (
                 "可以，我先帮你建任务。这个任务想叫什么？",
-                [ToolResult(name=tool_name, ok=False, content={"reason": "missing_task_title", "raw_message": message})],
+                _pending_task_tool_results(interpretation),
+                self._merge_primary_intent(current_intent, Intent.TASK_CRUD),
+            )
+        missing_schedule = _missing_task_schedule_fields(interpretation.task_start_at, interpretation.task_end_at)
+        if interpretation.task_action == TaskToolAction.CREATE and missing_schedule:
+            return (
+                _build_task_schedule_clarification(missing_schedule),
+                _pending_task_tool_results(interpretation),
                 self._merge_primary_intent(current_intent, Intent.TASK_CRUD),
             )
 
         reply, task_tool_results = await self._handle_task_intent(user_id, interpretation)
         return reply, task_tool_results, self._merge_primary_intent(current_intent, Intent.TASK_CRUD)
+
+    async def _apply_task_create_slot_filling(
+        self,
+        interpretation: IntentInterpretation,
+        *,
+        message: str,
+        pending_task_draft: PendingTaskDraftRecord | None,
+        recent_lines: list[str],
+        tasks: list,
+    ) -> IntentInterpretation:
+        if interpretation.task_action != TaskToolAction.CREATE:
+            if not pending_task_draft or not _looks_like_pending_task_reply(message, pending_task_draft):
+                return interpretation
+        now = datetime.now().astimezone()
+        extraction = await self.task_slot_extractor.extract(
+            message=message,
+            pending_task_draft=pending_task_draft,
+            recent_task_titles=[task.title for task in tasks[:5]],
+            today=now.date(),
+            timezone_name=now.tzname() or "UTC",
+            history_lines=recent_lines,
+        )
+        if extraction is not None:
+            return _apply_extracted_task_slots(interpretation, extraction)
+        return _merge_pending_task_interpretation(
+            interpretation,
+            message=message,
+            pending_task_draft=pending_task_draft,
+        )
 
     def _merge_primary_intent(self, current: Intent, incoming: Intent) -> Intent:
         order = {
@@ -734,6 +840,8 @@ class AssistantAgent:
             task_details=interpretation.task_details,
             task_status=interpretation.task_status,
             task_priority=interpretation.task_priority,
+            task_start_at=interpretation.task_start_at,
+            task_end_at=interpretation.task_end_at,
             task_due_at=interpretation.task_due_at,
             target_ref=interpretation.target_ref,
         )
@@ -979,6 +1087,223 @@ def _normalize_tool_target_ref(value: object, *, raw_title: str | None) -> str |
     ):
         return "recent_task"
     return None
+
+
+def _missing_task_schedule_fields(start_at: str | None, end_at: str | None) -> list[str]:
+    missing: list[str] = []
+    if not start_at:
+        missing.append("start_at")
+    if not end_at:
+        missing.append("end_at")
+    return missing
+
+
+def _build_task_schedule_clarification(missing: list[str]) -> str:
+    if missing == ["start_at", "end_at"]:
+        return "可以，我先帮你建这个待办。开始日期和结束日期分别是什么？"
+    if missing == ["start_at"]:
+        return "可以，我先帮你建这个待办。开始日期是什么？"
+    return "可以，我先帮你建这个待办。结束日期是什么？"
+
+
+def _pending_task_tool_results(interpretation: IntentInterpretation) -> list[ToolResult]:
+    if interpretation.task_action != TaskToolAction.CREATE:
+        return []
+    return [
+        ToolResult(
+            name="pending_task_create",
+            ok=False,
+            content={
+                "title": interpretation.task_title,
+                "details": interpretation.task_details,
+                "priority": interpretation.task_priority.value if interpretation.task_priority else None,
+                "start_at": interpretation.task_start_at,
+                "end_at": interpretation.task_end_at or interpretation.task_due_at,
+                "missing": _missing_pending_task_fields(interpretation),
+            },
+        )
+    ]
+
+
+def _missing_pending_task_fields(interpretation: IntentInterpretation) -> list[str]:
+    missing: list[str] = []
+    if not interpretation.task_title:
+        missing.append("title")
+    missing.extend(_missing_task_schedule_fields(interpretation.task_start_at, interpretation.task_end_at or interpretation.task_due_at))
+    return missing
+
+
+def _pending_task_draft_from_tool_results(
+    conversation_id: str,
+    tool_results: list[ToolResult],
+) -> PendingTaskDraftRecord | None:
+    for result in tool_results:
+        if result.name != "pending_task_create" or result.ok or not isinstance(result.content, dict):
+            continue
+        content = result.content
+        missing_fields = [str(item) for item in content.get("missing", []) if str(item).strip()]
+        return PendingTaskDraftRecord(
+            conversation_id=conversation_id,
+            title=_clean_tool_text(content.get("title")),
+            details=_clean_tool_text(content.get("details")),
+            priority=_clean_tool_text(content.get("priority")),
+            start_at=_clean_tool_text(content.get("start_at")),
+            end_at=_clean_tool_text(content.get("end_at")),
+            missing_fields=missing_fields,
+        )
+    return None
+
+
+def _merge_pending_task_interpretation(
+    interpretation: IntentInterpretation,
+    *,
+    message: str,
+    pending_task_draft: PendingTaskDraftRecord | None,
+) -> IntentInterpretation:
+    if interpretation.task_action == TaskToolAction.CREATE:
+        return _normalize_create_interpretation(interpretation, message=message, pending_task_draft=pending_task_draft)
+    if not pending_task_draft or not _looks_like_pending_task_reply(message, pending_task_draft):
+        return interpretation
+    return _normalize_create_interpretation(
+        IntentInterpretation(
+            primary_intent=Intent.TASK_CRUD,
+            task_action=TaskToolAction.CREATE,
+            should_execute=True,
+            task_title=interpretation.task_title,
+            task_details=interpretation.task_details,
+            task_priority=interpretation.task_priority,
+            task_start_at=interpretation.task_start_at,
+            task_end_at=interpretation.task_end_at,
+            task_due_at=interpretation.task_due_at,
+        ),
+        message=message,
+        pending_task_draft=pending_task_draft,
+    )
+
+
+def _normalize_create_interpretation(
+    interpretation: IntentInterpretation,
+    *,
+    message: str,
+    pending_task_draft: PendingTaskDraftRecord | None,
+) -> IntentInterpretation:
+    current_call = parse_task_tool_call(message)
+    current_start_at, current_end_at = extract_task_schedule_fields(message)
+    current_priority = current_call.priority
+
+    use_pending = pending_task_draft is not None and _looks_like_pending_task_reply(message, pending_task_draft)
+    title = current_call.title or interpretation.task_title
+    details = current_call.details or interpretation.task_details
+    priority = current_priority or interpretation.task_priority
+    start_at = current_start_at
+    end_at = current_end_at
+
+    if use_pending and pending_task_draft:
+        title = pending_task_draft.title or title
+        if not title and "title" in pending_task_draft.missing_fields:
+            title = _extract_followup_task_title(message)
+        details = pending_task_draft.details or details
+        priority = current_priority or _parse_tool_priority(pending_task_draft.priority) or priority
+        start_at = current_start_at or pending_task_draft.start_at
+        end_at = current_end_at or pending_task_draft.end_at
+
+    interpretation.primary_intent = Intent.TASK_CRUD
+    interpretation.task_action = TaskToolAction.CREATE
+    interpretation.task_title = title
+    interpretation.task_details = details
+    interpretation.task_priority = priority
+    interpretation.task_start_at = start_at
+    interpretation.task_end_at = end_at
+    interpretation.task_due_at = end_at
+
+    missing = []
+    if not interpretation.task_title:
+        missing.append("title")
+    missing.extend(_missing_task_schedule_fields(interpretation.task_start_at, interpretation.task_end_at))
+    interpretation.should_execute = not missing
+    interpretation.needs_clarification = bool(missing)
+    if "title" in missing:
+        interpretation.clarification_prompt = "可以，我先帮你建任务。这个任务想叫什么？"
+    elif missing:
+        interpretation.clarification_prompt = _build_task_schedule_clarification(
+            [item for item in missing if item in {"start_at", "end_at"}]
+        )
+    else:
+        interpretation.clarification_prompt = None
+    return interpretation
+
+
+def _apply_extracted_task_slots(
+    interpretation: IntentInterpretation,
+    extraction: ExtractedTaskSlots,
+) -> IntentInterpretation:
+    interpretation.primary_intent = Intent.TASK_CRUD
+    interpretation.task_action = TaskToolAction.CREATE
+    interpretation.task_title = extraction.title
+    interpretation.task_details = extraction.details
+    interpretation.task_priority = extraction.priority
+    interpretation.task_start_at = extraction.start_at
+    interpretation.task_end_at = extraction.end_at
+    interpretation.task_due_at = extraction.end_at
+
+    missing: list[str] = []
+    if not interpretation.task_title:
+        missing.append("title")
+    missing.extend(_missing_task_schedule_fields(interpretation.task_start_at, interpretation.task_end_at))
+    if extraction.normalization_errors:
+        missing.extend([field for field in extraction.normalization_errors if field not in missing])
+
+    interpretation.should_execute = not missing
+    interpretation.needs_clarification = bool(missing)
+    if "title" in missing:
+        interpretation.clarification_prompt = "可以，我先帮你建任务。这个任务想叫什么？"
+    elif extraction.normalization_errors:
+        interpretation.clarification_prompt = _build_date_normalization_clarification(extraction)
+    elif missing:
+        interpretation.clarification_prompt = _build_task_schedule_clarification(
+            [item for item in missing if item in {"start_at", "end_at"}]
+        )
+    else:
+        interpretation.clarification_prompt = None
+    return interpretation
+
+
+def _build_date_normalization_clarification(extraction: ExtractedTaskSlots) -> str:
+    labels = {
+        "start_at": ("开始日期", extraction.start_at_raw),
+        "end_at": ("结束日期", extraction.end_at_raw),
+    }
+    problematic = [(field, labels[field][1]) for field in extraction.normalization_errors if field in labels]
+    if len(problematic) == 2:
+        return (
+            f"我识别到了开始日期“{problematic[0][1]}”和结束日期“{problematic[1][1]}”，"
+            "但还不能稳定标准化。你可以改成 YYYY-MM-DD 吗？"
+        )
+    if problematic:
+        label, raw = problematic[0]
+        return f"我识别到了{labels[label][0]}“{raw}”，但还不能稳定标准化。你可以改成 YYYY-MM-DD 吗？"
+    return "我还不能稳定标准化这个日期。你可以改成 YYYY-MM-DD 吗？"
+
+
+def _looks_like_pending_task_reply(message: str, pending_task_draft: PendingTaskDraftRecord) -> bool:
+    current_call = parse_task_tool_call(message)
+    if current_call.action == TaskToolAction.CREATE and current_call.title:
+        return False
+    current_start_at, current_end_at = extract_task_schedule_fields(message)
+    if current_start_at or current_end_at:
+        return True
+    return "title" in pending_task_draft.missing_fields and _extract_followup_task_title(message) is not None
+
+
+def _extract_followup_task_title(message: str) -> str | None:
+    cleaned = message.strip().strip("\"'“”").strip(" ，。,:：")
+    if not cleaned:
+        return None
+    if any(token in cleaned for token in ("开始日期", "结束日期", "截止日期", "开始时间", "结束时间")):
+        return None
+    if len(cleaned) < 2 or is_generic_task_reference(cleaned):
+        return None
+    return cleaned
 
 
 def _extract_name(message: str, *, allow_standalone: bool = False) -> str | None:
