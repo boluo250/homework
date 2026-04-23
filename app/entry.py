@@ -111,7 +111,11 @@ class AppContainer:
             app_name=getattr(env, "APP_NAME", "TaskMate"),
         )
         self.openrouter_client = OpenRouterClient(chat_provider)
-        search_service = SearchService(api_key=getattr(env, "SERPER_API_KEY", None))
+        search_service = SearchService(
+            api_key=getattr(env, "SERPER_API_KEY", None),
+            default_region=getattr(env, "SERPER_SEARCH_GL", None),
+            default_locale=getattr(env, "SERPER_SEARCH_HL", None),
+        )
         qdrant_remote_url = _resolve_qdrant_remote_url(getattr(env, "QDRANT_URL", None))
         qdrant_store = QdrantStore(
             storage_path=DATA_DIR / "qdrant_document_chunks.json",

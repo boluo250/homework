@@ -254,7 +254,7 @@ class ResearchAgent:
         fallback: list[dict] = []
 
         for search_query in step.search_queries:
-            results = await self.search_service.search(search_query)
+            results = await self.search_service.search(search_query, limit=step.max_sources)
             for item in results:
                 url = str(item.get("url", "")).strip()
                 dedupe_key = url or f"{search_query}:{item.get('title', '')}"
@@ -262,7 +262,7 @@ class ResearchAgent:
                     continue
                 seen_urls.add(dedupe_key)
                 excerpt = ""
-                if url and "serper.dev" not in url:
+                if url and bool(item.get("is_live_result", True)):
                     excerpt = await self.web_fetch_service.fetch_text(url)
                 domain = _extract_domain(url)
                 source = {
