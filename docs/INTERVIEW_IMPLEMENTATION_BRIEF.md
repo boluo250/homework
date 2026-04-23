@@ -1,5 +1,9 @@
 # TaskMate 实现说明
 
+项目 Demo：https://taskmate-homework.keximing-taskmate.workers.dev/
+
+GitHub 仓库：https://github.com/boluo250/homework
+
 ## 整体架构
 
 TaskMate 是一个部署在 Cloudflare Worker 上的轻量级任务助理 MVP，采用分层架构：前端 UI 负责对话、任务栏、文件工作区和研究报告展示；Worker API 负责路由请求；主 Agent 负责意图识别、上下文组装和工具调度；服务层负责任务、搜索、研究、文件解析、RAG 和记忆管理。
