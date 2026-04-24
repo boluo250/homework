@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 
@@ -43,6 +44,7 @@ class HttpResponse:
     status: int = 200
     headers: dict[str, str] = field(default_factory=dict)
     body: bytes = b""
+    stream_chunks: Any = None
 
     @classmethod
     def json(cls, payload: dict | list, status: int = 200) -> "HttpResponse":
@@ -66,4 +68,30 @@ class HttpResponse:
             status=status,
             headers={"content-type": "text/html; charset=utf-8"},
             body=payload.encode("utf-8"),
+        )
+
+    @classmethod
+    def sse(cls, events: list[bytes], status: int = 200) -> "HttpResponse":
+        return cls(
+            status=status,
+            headers={
+                "content-type": "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache, no-transform",
+                "connection": "keep-alive",
+            },
+            body=b"".join(events),
+            stream_chunks=events,
+        )
+
+    @classmethod
+    def sse_stream(cls, stream_chunks: Any, status: int = 200) -> "HttpResponse":
+        return cls(
+            status=status,
+            headers={
+                "content-type": "text/event-stream; charset=utf-8",
+                "cache-control": "no-cache, no-transform",
+                "connection": "keep-alive",
+            },
+            body=b"",
+            stream_chunks=stream_chunks,
         )

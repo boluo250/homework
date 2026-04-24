@@ -174,6 +174,63 @@ def test_demo_e2e_chat_task_and_search_flow(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_demo_e2e_chat_stream_returns_sse_events(tmp_path: Path) -> None:
+    async def run() -> None:
+        container = build_demo_container(tmp_path)
+        client_id = "demo-chat-stream-client"
+        profile = await chat(container, client_id, "我叫流式同学，我的邮箱是 stream@example.com")
+
+        streamed = await stream_chat(
+            container,
+            client_id,
+            "你好，帮我总结一下这个系统能做什么",
+            conversation_id=profile["conversation_id"],
+        )
+
+        assert streamed["meta"]["intent"] == "general_chat"
+        assert streamed["done"]["reply"] == "流式同学，这是一个本地演示回答，用于验证端到端链路。"
+        assert streamed["reply"] == streamed["done"]["reply"]
+        assert streamed["status"]["label"] == "正在整理文件内容"
+
+    asyncio.run(run())
+
+
+def test_demo_e2e_file_summary_stream_emits_probe_events(tmp_path: Path) -> None:
+    async def run() -> None:
+        container = build_demo_container(tmp_path)
+        client_id = "demo-file-stream-client"
+        profile = await chat(container, client_id, "我叫流式文件同学，我的邮箱是 file-stream@example.com")
+
+        upload = await request_json(
+            container,
+            "POST",
+            "/api/files",
+            {
+                "client_id": client_id,
+                "filename": "memory.txt",
+                "content_type": "text/plain",
+                "content_base64": base64.b64encode(
+                    "Agent 记忆系统支持短期与长期记忆，并通过检索与压缩提升多轮任务表现。".encode("utf-8")
+                ).decode("utf-8"),
+            },
+        )
+
+        streamed = await stream_chat(
+            container,
+            client_id,
+            "总结这个文档",
+            conversation_id=profile["conversation_id"],
+            file_ids=[upload["file"]["id"]],
+        )
+
+        assert streamed["meta"]["intent"] == "file_qa"
+        assert streamed["probes"]
+        assert streamed["probes"][0]["stage"] == "file_qa_start"
+        assert any(item["stage"] == "file_qa_retrieved" for item in streamed["probes"])
+
+    asyncio.run(run())
+
+
 def test_demo_e2e_file_workspace_and_rag_flow(tmp_path: Path) -> None:
     async def run() -> None:
         container = build_demo_container(tmp_path)
@@ -438,6 +495,69 @@ async def request_json(
     response = await request(container, method, path, payload)
     assert response.headers.get("content-type", "").startswith("application/json")
     return json.loads(response.body.decode("utf-8"))
+
+
+async def stream_chat(
+    container: DemoContainer,
+    client_id: str,
+    message: str,
+    conversation_id: str | None = None,
+    file_ids: list[str] | None = None,
+) -> dict:
+    response = await request(
+        container,
+        "POST",
+        "/api/chat/stream",
+        {
+            "client_id": client_id,
+            "conversation_id": conversation_id,
+            "message": message,
+            "file_ids": file_ids or [],
+        },
+    )
+    assert response.headers.get("content-type", "").startswith("text/event-stream")
+    raw_body = response.body
+    if response.stream_chunks and hasattr(response.stream_chunks, "__aiter__"):
+        parts: list[bytes] = []
+        async for chunk in response.stream_chunks:
+            parts.append(chunk)
+        raw_body = b"".join(parts)
+    status = None
+    meta = None
+    done = None
+    probes: list[dict] = []
+    reply_parts: list[str] = []
+    for block in raw_body.decode("utf-8").split("\n\n"):
+        parsed = parse_sse_block(block)
+        if not parsed:
+            continue
+        if parsed["event"] == "status":
+            status = parsed["data"]
+        elif parsed["event"] == "probe":
+            probes.append(parsed["data"])
+        elif parsed["event"] == "meta":
+            meta = parsed["data"]
+        elif parsed["event"] == "delta":
+            reply_parts.append(str(parsed["data"].get("text", "")))
+        elif parsed["event"] == "done":
+            done = parsed["data"]
+    return {"status": status, "meta": meta, "done": done, "reply": "".join(reply_parts), "probes": probes}
+
+
+def parse_sse_block(block: str) -> dict | None:
+    lines = [line.strip() for line in block.split("\n") if line.strip()]
+    if not lines:
+        return None
+    event = "message"
+    data_lines: list[str] = []
+    for line in lines:
+        if line.startswith("event:"):
+            event = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].strip())
+    if not data_lines:
+        return None
+    return {"event": event, "data": json.loads("\n".join(data_lines))}
 
 
 async def request(

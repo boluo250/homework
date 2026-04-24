@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import AsyncIterator
 
 from app.services.http_client import HttpClient
 
@@ -37,6 +38,60 @@ class OpenRouterChatProvider(ChatProviderBase):
         )
         return response.content or "OpenRouter returned an empty response."
 
+    async def chat_stream(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+    ) -> AsyncIterator[str]:
+        if not self.api_key:
+            fallback = (
+                "OpenRouter provider is not configured yet, so I am using the local fallback "
+                "response path. You can keep chatting, and task features still work."
+            )
+            yield fallback
+            return
+
+        headers = self._build_headers()
+        payload = self._build_payload(system_prompt=system_prompt, user_message=user_message, tools=None, stream=True)
+        buffer = ""
+        saw_delta = False
+        truncated = False
+        try:
+            async for chunk in self.http_client.request_stream_text(
+                "POST",
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json_body=payload,
+            ):
+                buffer += chunk
+                events, buffer = self._consume_stream_blocks(buffer)
+                for event in events:
+                    if event == "[DONE]":
+                        buffer = ""
+                        break
+                    text = self._extract_stream_text(event)
+                    if text:
+                        saw_delta = True
+                        yield text
+                    if self._is_length_truncated(event):
+                        truncated = True
+        except Exception as exc:  # noqa: BLE001
+            yield f"OpenRouter request failed: {exc}"
+            return
+        if buffer.strip():
+            for event in self._consume_stream_tail(buffer):
+                text = self._extract_stream_text(event)
+                if text:
+                    saw_delta = True
+                    yield text
+                if self._is_length_truncated(event):
+                    truncated = True
+        if not saw_delta:
+            yield "OpenRouter returned an empty response."
+        elif truncated:
+            yield "\n\n[回答因输出长度限制被截断]"
+
     def supports_tool_calls(self) -> bool:
         return bool(self.api_key)
 
@@ -68,34 +123,8 @@ class OpenRouterChatProvider(ChatProviderBase):
                 )
             )
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        if self.app_name:
-            headers["X-Title"] = self.app_name
-
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            "max_tokens": self.max_tokens,
-            "temperature": 0.2,
-        }
-        if tools:
-            payload["tools"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    },
-                }
-                for tool in tools
-            ]
+        headers = self._build_headers()
+        payload = self._build_payload(system_prompt=system_prompt, user_message=user_message, tools=tools)
         try:
             response = await self.http_client.request(
                 "POST",
@@ -173,11 +202,99 @@ class OpenRouterChatProvider(ChatProviderBase):
 
         return ""
 
+    def _build_headers(self) -> dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.app_name:
+            headers["X-Title"] = self.app_name
+        return headers
+
+    def _build_payload(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        tools: list[ToolDefinition] | None,
+        stream: bool = False,
+    ) -> dict:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            "max_tokens": self.max_tokens,
+            "temperature": 0.2,
+        }
+        if stream:
+            payload["stream"] = True
+            # Favor visible incremental text over hidden long reasoning phases.
+            payload["reasoning"] = {"effort": "none", "exclude": True}
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                }
+                for tool in tools
+            ]
+        return payload
+
     def _finalize_text(self, text: str, choice: dict) -> str:
         finish_reason = str(choice.get("finish_reason", "") or "").strip().lower()
         if finish_reason == "length":
             return text.rstrip() + "\n\n[回答因输出长度限制被截断]"
         return text.strip()
+
+    def _consume_stream_blocks(self, buffer: str) -> tuple[list[object], str]:
+        blocks = buffer.split("\n\n")
+        tail = blocks.pop() if blocks else ""
+        events = [event for event in (self._parse_stream_block(block) for block in blocks) if event is not None]
+        return events, tail
+
+    def _consume_stream_tail(self, buffer: str) -> list[object]:
+        parsed = self._parse_stream_block(buffer)
+        return [parsed] if parsed is not None else []
+
+    def _parse_stream_block(self, block: str) -> object | None:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            return None
+        data_lines = [line.split(":", 1)[1].strip() for line in lines if line.startswith("data:")]
+        if not data_lines:
+            return None
+        raw = "\n".join(data_lines)
+        if raw == "[DONE]":
+            return "[DONE]"
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    def _extract_stream_text(self, payload: object) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        delta = choices[0].get("delta")
+        if delta is None:
+            delta = choices[0].get("message")
+        return self._extract_text(delta)
+
+    def _is_length_truncated(self, payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return False
+        return str(choices[0].get("finish_reason", "") or "").strip().lower() == "length"
 
     def _extract_tool_calls(self, payload: object) -> list[ToolCall]:
         if not isinstance(payload, dict):

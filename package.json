@@ -1,4 +1,8 @@
 {
+  "scripts": {
+    "build:ui-assets": "python3 scripts/embed_ui_assets.py",
+    "deploy": "npm run build:ui-assets && npx wrangler deploy"
+  },
   "devDependencies": {
     "wrangler": "^4.83.0"
   }

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, AsyncIterator
 
 from app.core.intent_interpreter import IntentInterpretation, LLMIntentInterpreter
 from app.core.models import ChatRequest, ChatResponse, Intent, PendingTaskDraftRecord, TaskPriority, TaskStatus, ToolResult
@@ -93,11 +94,25 @@ class AssistantAgent:
             )
 
         tasks = await self.repository.list_tasks(user.id)
+        force_file_qa = _should_force_file_qa(request.message, request.file_ids)
         should_bypass_tool_router = pending_task_draft is not None and _looks_like_pending_task_reply(
             request.message,
             pending_task_draft,
         )
-        if self.chat_provider.supports_tool_calls() and not should_bypass_tool_router:
+        if force_file_qa:
+            reply, tool_results = await self._handle_file_qa(
+                user_id=user.id,
+                message=request.message,
+                file_ids=request.file_ids,
+            )
+            outcome = {
+                "intent": Intent.FILE_QA,
+                "reply": reply,
+                "tool_results": tool_results,
+                "user": user,
+                "settings": settings,
+            }
+        elif self.chat_provider.supports_tool_calls() and not should_bypass_tool_router:
             outcome = await self._handle_tool_routed_turn(
                 request=request,
                 user=user,
@@ -150,6 +165,379 @@ class AssistantAgent:
             user_profile=user,
             assistant_name=settings.bot_name,
         )
+
+    async def stream_chat_events(self, request: ChatRequest) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        user = await self.repository.get_or_create_user(request.client_id)
+        settings = await self.repository.get_or_create_assistant_settings(user.id)
+        conversation = await self.repository.get_or_create_conversation(user.id, request.conversation_id)
+        profile_was_incomplete = user.needs_profile_completion
+        user_message_record = await self.repository.add_message(conversation.id, "user", request.message)
+        if self.memory_service is not None:
+            await self.memory_service.store_message(
+                user_id=user.id,
+                conversation_id=conversation.id,
+                message_id=user_message_record.id,
+                role="user",
+                content=request.message,
+            )
+
+        messages = await self.repository.list_messages(conversation.id)
+        summary = await self.repository.get_summary(conversation.id)
+        context_bundle = self.context_manager.build(messages, summary)
+        pending_task_draft = await self.repository.get_pending_task_draft(conversation.id)
+        if context_bundle.should_refresh_summary and context_bundle.summary_text:
+            await self.repository.save_summary(
+                conversation.id,
+                context_bundle.summary_text,
+                context_bundle.source_message_count,
+            )
+
+        tasks = await self.repository.list_tasks(user.id)
+        force_file_qa = _should_force_file_qa(request.message, request.file_ids)
+        should_bypass_tool_router = pending_task_draft is not None and _looks_like_pending_task_reply(
+            request.message,
+            pending_task_draft,
+        )
+
+        yield ("status", {"label": _stream_status_label(request.message)})
+
+        if force_file_qa:
+            streamed_file_qa: dict[str, Any] = {}
+            async for item in self._handle_file_qa_stream(
+                user_id=user.id,
+                message=request.message,
+                file_ids=request.file_ids,
+                state=streamed_file_qa,
+            ):
+                yield item
+            outcome = {
+                "intent": Intent.FILE_QA,
+                "reply": streamed_file_qa["reply"],
+                "tool_results": streamed_file_qa["tool_results"],
+                "user": user,
+                "settings": settings,
+            }
+        elif self.chat_provider.supports_tool_calls() and not should_bypass_tool_router:
+            tool_response = await self.chat_provider.chat_with_tools(
+                system_prompt=self._build_tool_router_prompt(
+                    user=user,
+                    assistant_name=settings.bot_name,
+                    summary=context_bundle.summary_text,
+                    recent_messages=context_bundle.recent_lines,
+                    tasks=tasks,
+                    message=request.message,
+                    file_ids=request.file_ids,
+                ),
+                user_message=request.message,
+                tools=self._build_business_tools(file_ids=request.file_ids),
+            )
+            if (
+                len(tool_response.tool_calls) == 1
+                and tool_response.tool_calls[0].name == "answer_file_question"
+                and not self._looks_like_provider_failure(tool_response.content or "")
+            ):
+                streamed_file_qa: dict[str, Any] = {}
+                async for item in self._stream_single_file_qa_tool_call(
+                    request=request,
+                    user=user,
+                    settings=settings,
+                    tool_call=tool_response.tool_calls[0],
+                    state=streamed_file_qa,
+                ):
+                    yield item
+                outcome = {
+                    "intent": Intent.FILE_QA,
+                    "reply": streamed_file_qa["reply"],
+                    "tool_results": streamed_file_qa["tool_results"],
+                    "user": user,
+                    "settings": settings,
+                }
+            else:
+                if self._looks_like_provider_failure(tool_response.content or ""):
+                    outcome = await self._handle_interpreted_turn(
+                        request=request,
+                        user=user,
+                        settings=settings,
+                        context_bundle=context_bundle,
+                        tasks=tasks,
+                        profile_was_incomplete=profile_was_incomplete,
+                        pending_task_draft=pending_task_draft,
+                    )
+                elif not tool_response.tool_calls:
+                    if tool_response.content:
+                        outcome = {
+                            "intent": Intent.GENERAL_CHAT,
+                            "reply": tool_response.content,
+                            "tool_results": [],
+                            "user": user,
+                            "settings": settings,
+                        }
+                    else:
+                        outcome = await self._handle_interpreted_turn(
+                            request=request,
+                            user=user,
+                            settings=settings,
+                            context_bundle=context_bundle,
+                            tasks=tasks,
+                            profile_was_incomplete=profile_was_incomplete,
+                            pending_task_draft=pending_task_draft,
+                        )
+                else:
+                    outcome = await self._handle_tool_routed_response(
+                        request=request,
+                        user=user,
+                        settings=settings,
+                        context_bundle=context_bundle,
+                        tasks=tasks,
+                        profile_was_incomplete=profile_was_incomplete,
+                        pending_task_draft=pending_task_draft,
+                        tool_response=tool_response,
+                    )
+                if outcome["reply"]:
+                    reply = self._personalize_reply(outcome["reply"], outcome["user"].name, intent=outcome["intent"])
+                    outcome["reply"] = reply
+                    async for item in self._yield_text_as_events(reply):
+                        yield item
+        else:
+            outcome = await self._handle_interpreted_turn(
+                request=request,
+                user=user,
+                settings=settings,
+                context_bundle=context_bundle,
+                tasks=tasks,
+                profile_was_incomplete=profile_was_incomplete,
+                pending_task_draft=pending_task_draft,
+            )
+            if outcome["reply"]:
+                reply = self._personalize_reply(outcome["reply"], outcome["user"].name, intent=outcome["intent"])
+                outcome["reply"] = reply
+                async for item in self._yield_text_as_events(reply):
+                    yield item
+
+        user = outcome["user"]
+        settings = outcome["settings"]
+        intent = outcome["intent"]
+        tool_results = outcome["tool_results"]
+        reply = outcome["reply"]
+
+        await self._sync_pending_task_draft(conversation.id, tool_results)
+
+        assistant_message_record = await self.repository.add_message(
+            conversation.id,
+            "assistant",
+            reply,
+            tool_calls_json=json.dumps([item.to_dict() for item in tool_results], ensure_ascii=False) if tool_results else None,
+        )
+        if self.memory_service is not None:
+            await self.memory_service.store_message(
+                user_id=user.id,
+                conversation_id=conversation.id,
+                message_id=assistant_message_record.id,
+                role="assistant",
+                content=reply,
+            )
+        final_response = ChatResponse(
+            reply=reply,
+            intent=intent,
+            conversation_id=conversation.id,
+            tool_results=tool_results,
+            user_profile=user,
+            assistant_name=settings.bot_name,
+        )
+        yield (
+            "meta",
+            {
+                "conversation_id": conversation.id,
+                "intent": intent.value,
+                "assistant_name": settings.bot_name,
+                "user_profile": asdict(user),
+            },
+        )
+        yield ("done", final_response.to_dict())
+
+    async def _yield_text_as_events(self, text: str) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        for chunk in _split_text_for_stream(text):
+            yield ("delta", {"text": chunk})
+
+    async def _stream_single_file_qa_tool_call(
+        self,
+        *,
+        request: ChatRequest,
+        user,
+        settings,
+        tool_call: ToolCall,
+        state: dict[str, Any],
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        _ = user
+        _ = settings
+        args = tool_call.arguments or {}
+        file_ids = _clean_tool_file_ids(args.get("file_ids")) or request.file_ids
+        question = _clean_tool_text(args.get("question")) or request.message
+        async for item in self._handle_file_qa_stream(
+            user_id=user.id,
+            message=question,
+            file_ids=file_ids,
+            state=state,
+        ):
+            yield item
+
+    async def _handle_tool_routed_response(
+        self,
+        *,
+        request: ChatRequest,
+        user,
+        settings,
+        context_bundle,
+        tasks: list,
+        profile_was_incomplete: bool,
+        pending_task_draft: PendingTaskDraftRecord | None,
+        tool_response,
+    ) -> dict[str, Any]:
+        primary_intent = Intent.GENERAL_CHAT
+        tool_results: list[ToolResult] = []
+        reply_parts: list[str] = []
+        ordered_calls = self._order_tool_calls(tool_response.tool_calls)
+        bot_name_updated = False
+
+        for tool_call in ordered_calls:
+            tool_name = tool_call.name
+            args = tool_call.arguments or {}
+
+            if tool_name == "save_profile":
+                name = _clean_tool_text(args.get("name"))
+                email = _clean_tool_email(args.get("email"))
+                if name or email:
+                    user = await self.profile_tool.set(user.id, name=name, email=email)
+                    tool_results.append(ToolResult(name="save_profile", ok=True, content={"name": user.name, "email": user.email}))
+                    primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+                else:
+                    tool_results.append(ToolResult(name="save_profile", ok=False, content={"reason": "missing_profile_fields"}))
+                continue
+
+            if tool_name == "recall_profile":
+                field = _normalize_profile_field(args.get("field"))
+                reply_parts.append(await self.profile_tool.get(user, field))
+                tool_results.append(ToolResult(name="recall_profile", ok=True, content={"field": field}))
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+                continue
+
+            if tool_name == "rename_assistant":
+                assistant_name = _clean_tool_text(args.get("assistant_name"))
+                if assistant_name:
+                    settings = await self.assistant_identity_tool.set(user.id, assistant_name)
+                    bot_name_updated = True
+                    reply_parts.append(f"以后你可以叫我 {settings.bot_name}。")
+                    tool_results.append(ToolResult(name="rename_assistant", ok=True, content={"assistant_name": settings.bot_name}))
+                    primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+                else:
+                    tool_results.append(ToolResult(name="rename_assistant", ok=False, content={"reason": "missing_assistant_name"}))
+                continue
+
+            if tool_name == "get_assistant_name":
+                settings = await self.assistant_identity_tool.get(user.id)
+                reply_parts.append(f"你现在叫我 {settings.bot_name}。")
+                tool_results.append(ToolResult(name="get_assistant_name", ok=True, content={"assistant_name": settings.bot_name}))
+                continue
+
+            if tool_name in {
+                TaskToolAction.CREATE.value,
+                TaskToolAction.UPDATE.value,
+                TaskToolAction.DELETE.value,
+                TaskToolAction.GET.value,
+                TaskToolAction.LIST.value,
+            }:
+                task_reply, task_tool_results, primary_intent = await self._execute_routed_task_call(
+                    user_id=user.id,
+                    message=request.message,
+                    tool_name=tool_name,
+                    args=args,
+                    current_intent=primary_intent,
+                    user=user,
+                    assistant_name=settings.bot_name,
+                    pending_task_draft=pending_task_draft,
+                    tasks=tasks,
+                    recent_lines=context_bundle.recent_lines,
+                )
+                reply_parts.append(task_reply)
+                tool_results.extend(task_tool_results)
+                continue
+
+            if tool_name == "search_web":
+                query = _clean_tool_text(args.get("query")) or request.message
+                results = await self.search_service.search(query)
+                tool_results.append(ToolResult(name="search_web", ok=True, content=results))
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.SEARCH_WEB)
+                if results:
+                    bullets = "\n".join(f"- {item['title']}: {item['snippet']}" for item in results)
+                    reply_parts.append(f"我先帮你整理了搜索结果：\n{bullets}")
+                else:
+                    reply_parts.append("我先帮你查了，但现在还没有拿到可用搜索结果。")
+                continue
+
+            if tool_name == "start_research":
+                query = _clean_tool_text(args.get("query")) or request.message
+                plan = self.research_tool.build_plan(query)
+                tool_results.extend(
+                    [
+                        ToolResult(name="deep_research_plan", ok=True, content=plan),
+                        ToolResult(name="deep_research_job", ok=True, content={"mode": "async", "query": query}),
+                    ]
+                )
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.DEEP_RESEARCH)
+                reply_parts.append(
+                    "我已经开始真正执行这次研究了：会先拆题，再做网页检索、正文阅读和结论汇总。"
+                    "下方研究结果区会持续刷新进度，这里先把研究计划同步给你：\n"
+                    + "\n".join(f"- {item}" for item in plan)
+                )
+                continue
+
+            if tool_name == "answer_file_question":
+                file_ids = _clean_tool_file_ids(args.get("file_ids")) or request.file_ids
+                question = _clean_tool_text(args.get("question")) or request.message
+                file_outcome = await self._handle_file_qa(user_id=user.id, message=question, file_ids=file_ids)
+                tool_results.extend(file_outcome[1])
+                reply_parts.append(file_outcome[0])
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.FILE_QA)
+                continue
+
+            if tool_name == "list_uploaded_files":
+                inv_reply, inv_results = await self._list_uploaded_files_reply(user_id=user.id)
+                tool_results.extend(inv_results)
+                reply_parts.append(inv_reply)
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.FILE_QA)
+                continue
+
+            tool_results.append(ToolResult(name=tool_name, ok=False, content={"reason": "unknown_tool"}))
+
+        if not reply_parts:
+            if profile_was_incomplete and not user.needs_profile_completion:
+                reply_parts.append(self.profile_tool.build_saved_reply(user, settings.bot_name, bot_name_updated=bot_name_updated))
+                primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+            elif tool_response.content:
+                reply_parts.append(tool_response.content)
+            else:
+                return await self._handle_interpreted_turn(
+                    request=request,
+                    user=user,
+                    settings=settings,
+                    context_bundle=context_bundle,
+                    tasks=tasks,
+                    profile_was_incomplete=profile_was_incomplete,
+                    pending_task_draft=pending_task_draft,
+                )
+        elif profile_was_incomplete and not user.needs_profile_completion and not any(
+            "我记住了" in part or "你是" in part for part in reply_parts
+        ):
+            reply_parts.insert(0, self.profile_tool.build_saved_reply(user, settings.bot_name, bot_name_updated=bot_name_updated))
+            primary_intent = self._merge_primary_intent(primary_intent, Intent.COLLECT_USER_PROFILE)
+
+        return {
+            "intent": primary_intent,
+            "reply": "\n\n".join(part for part in reply_parts if part.strip()),
+            "tool_results": tool_results,
+            "user": user,
+            "settings": settings,
+        }
 
     async def get_session_meta(self, client_id: str) -> dict:
         user = await self.repository.get_or_create_user(client_id)
@@ -794,6 +1182,111 @@ class AssistantAgent:
         reply = append_file_citations(reply, rag_hits, used_evidence_ids=used_evidence_ids)
         return reply, tool_results
 
+    async def _handle_file_qa_stream(
+        self,
+        *,
+        user_id: str,
+        message: str,
+        file_ids: list[str] | None,
+        state: dict[str, Any],
+        answer_mode: str | None = None,
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        yield (
+            "probe",
+            {
+                "stage": "file_qa_start",
+                "preview": "已进入文档流式链路，正在检索相关片段...",
+            },
+        )
+        self._log_file_qa("start", user_id=user_id, message=message, file_ids=file_ids or [])
+        rag_hits = await self.rag_service.retrieve(
+            user_id=user_id,
+            query=message,
+            file_ids=file_ids,
+            limit=6,
+        )
+        self._log_file_qa(
+            "retrieved",
+            user_id=user_id,
+            hit_count=len(rag_hits),
+            hit_files=[hit.get("payload", {}).get("filename", "unknown") for hit in rag_hits],
+            file_ids=file_ids or [],
+        )
+        yield (
+            "probe",
+            {
+                "stage": "file_qa_retrieved",
+                "preview": "已命中文档片段，正在生成总结...",
+                "hit_count": len(rag_hits),
+            },
+        )
+        tool_results = [ToolResult(name="file_qa", ok=True, content=rag_hits)]
+        if not rag_hits:
+            state["reply"] = "文件问答链路已经接好接口，但当前还没有可用的向量检索结果。"
+            state["tool_results"] = tool_results
+            return
+
+        all_files = await self.repository.list_files(user_id)
+        selected_files = [item for item in all_files if not file_ids or item.id in file_ids]
+        file_descriptions = []
+        for item in selected_files[:3]:
+            summary = (item.summary or "").strip()
+            file_descriptions.append(f"- {item.filename}: {summary[:180] if summary else '暂无摘要'}")
+
+        evidence_blocks = []
+        total_chars = 0
+        question_mode = answer_mode or _infer_document_qa_mode(message)
+        full_document_context = await self._build_selected_document_context(
+            user_id=user_id,
+            selected_files=selected_files,
+            question_mode=question_mode,
+        )
+        for index, hit in enumerate(rag_hits, start=1):
+            snippet = str(hit.get("text", "")).strip()
+            if not snippet:
+                continue
+            snippet = re.sub(r"\n{3,}", "\n\n", snippet)[:900]
+            block = (
+                f"[片段 {index}] "
+                f"filename={hit.get('payload', {}).get('filename', 'unknown')} "
+                f"chunk_index={hit.get('payload', {}).get('chunk_index', 'n/a')} "
+                f"score={float(hit.get('score', 0.0)):.3f}\n{snippet}"
+            )
+            if total_chars + len(block) > 5000 and evidence_blocks:
+                break
+            evidence_blocks.append(block)
+            total_chars += len(block)
+
+        system_prompt, user_prompt = build_file_qa_prompt_bundle(
+            question=message,
+            question_mode=question_mode,
+            file_descriptions=file_descriptions,
+            full_document_context=full_document_context,
+            evidence_blocks=evidence_blocks,
+        )
+        reply_parts: list[str] = []
+        try:
+            async for chunk in self.chat_provider.chat_stream(system_prompt=system_prompt, user_message=user_prompt):
+                reply_parts.append(chunk)
+                yield ("delta", {"text": chunk})
+        except Exception as exc:
+            self._log_file_qa("model_call.error", user_id=user_id, error=str(exc))
+            raise
+
+        raw_reply = "".join(reply_parts).strip()
+        if self._looks_like_provider_failure(raw_reply):
+            state["reply"] = append_file_citations(
+                self._fallback_file_qa_reply(message, rag_hits),
+                rag_hits,
+                used_evidence_ids=list(range(1, min(len(rag_hits), 4) + 1)),
+            )
+            state["tool_results"] = tool_results
+            return
+
+        final_reply, used_evidence_ids = extract_answer_and_used_evidence_ids(raw_reply, evidence_count=len(evidence_blocks))
+        state["reply"] = append_file_citations(final_reply, rag_hits, used_evidence_ids=used_evidence_ids)
+        state["tool_results"] = tool_results
+
     async def _build_selected_document_context(
         self,
         *,
@@ -1008,6 +1501,60 @@ def _file_ingest_hint_for_list(*, summary: object, vector_count: int) -> str:
     if s == "[ingest_empty]":
         return "；状态：模型返回空文本，未生成可索引片段"
     return ""
+
+
+def _split_text_for_stream(text: str, *, chunk_size: int = 24) -> list[str]:
+    normalized = text or ""
+    if not normalized:
+        return []
+    return [normalized[index : index + chunk_size] for index in range(0, len(normalized), chunk_size)]
+
+
+def _stream_status_label(message: str) -> str:
+    lowered = message.lower()
+    if any(token in message for token in ("文档", "文件", "pdf", "docx", "总结", "概括", "归纳")):
+        return "正在整理文件内容"
+    if any(token in message for token in ("研究", "调研", "对比", "方案", "报告", "分析")):
+        return "正在准备研究计划"
+    if any(token in message for token in ("我的任务", "我的待办", "待办", "提醒我", "帮我创建", "给我记")) or "todo" in lowered:
+        return "正在处理任务请求"
+    return "正在思考"
+
+
+def _should_force_file_qa(message: str, file_ids: list[str] | None) -> bool:
+    if not file_ids:
+        return False
+    lowered = message.lower()
+    if any(ext in lowered for ext in (".pdf", ".docx", ".doc", ".txt", ".md")):
+        return True
+    content_keywords = (
+        "文档",
+        "文件",
+        "这篇",
+        "这份",
+        "这个材料",
+        "总结",
+        "概括",
+        "归纳",
+        "介绍",
+        "分析",
+        "评价",
+        "提取",
+        "列出",
+        "清单",
+        "字段",
+        "对比",
+        "比较",
+        "区别",
+        "是什么",
+        "为什么",
+        "如何",
+        "多少",
+    )
+    if any(keyword in message for keyword in content_keywords):
+        return True
+    english_keywords = ("summary", "summarize", "overview", "analyze", "compare", "extract", "what", "why", "how")
+    return any(keyword in lowered for keyword in english_keywords)
 
 
 def _clean_tool_text(value: object) -> str | None:

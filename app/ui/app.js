@@ -92,30 +92,11 @@ async function sendChatMessage(message) {
   setComposerBusy(true);
 
   try {
-    const response = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        client_id: state.clientId,
-        conversation_id: state.conversationId || null,
-        message,
-        file_ids: Array.from(state.selectedFileIds),
-      }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "Request failed");
+    const payload = await requestChatStream(message, pendingMessageId);
+    syncChatPayload(payload);
+    if (!payload.reply) {
+      updateMessage(pendingMessageId, "");
     }
-
-    state.conversationId = payload.conversation_id;
-    localStorage.setItem(storageKeys.conversationId, state.conversationId);
-    if (payload.assistant_name) {
-      applyAssistantIdentity(payload.assistant_name);
-    }
-    if (payload.user_profile) {
-      applyUserProfile(payload.user_profile);
-    }
-    updateMessage(pendingMessageId, payload.reply);
 
     await refreshTasks(payload.user_profile?.id);
     await refreshFiles();
@@ -129,6 +110,193 @@ async function sendChatMessage(message) {
     return null;
   } finally {
     setComposerBusy(false);
+  }
+}
+
+function buildChatPayload(message) {
+  return {
+    client_id: state.clientId,
+    conversation_id: state.conversationId || null,
+    message,
+    file_ids: Array.from(state.selectedFileIds),
+  };
+}
+
+function syncChatPayload(payload) {
+  if (!payload) {
+    return;
+  }
+  if (payload.conversation_id) {
+    state.conversationId = payload.conversation_id;
+    localStorage.setItem(storageKeys.conversationId, state.conversationId);
+  }
+  if (payload.assistant_name) {
+    applyAssistantIdentity(payload.assistant_name);
+  }
+  if (payload.user_profile) {
+    applyUserProfile(payload.user_profile);
+  }
+}
+
+async function requestChatStream(message, pendingMessageId) {
+  const requestStartedAt = Date.now();
+  const response = await fetch("/api/chat/stream", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(buildChatPayload(message)),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+  if (!response.body) {
+    const payload = await requestChatJson(message);
+    updateMessage(pendingMessageId, payload.reply || "");
+    return payload;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let reply = "";
+  let finalPayload = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      buffer += decoder.decode();
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    ({ buffer, reply, finalPayload } = applySseBlocks(buffer, {
+      pendingMessageId,
+      reply,
+      finalPayload,
+      requestStartedAt,
+    }));
+  }
+
+  ({ buffer, reply, finalPayload } = applySseBlocks(buffer, {
+    pendingMessageId,
+    reply,
+    finalPayload,
+    flush: true,
+    requestStartedAt,
+  }));
+
+  if (!finalPayload) {
+    throw new Error("流式响应未正常结束");
+  }
+  if (finalPayload.reply && finalPayload.reply !== reply) {
+    updateMessage(pendingMessageId, finalPayload.reply);
+  }
+  return finalPayload;
+}
+
+function applySseBlocks(rawBuffer, stateSnapshot) {
+  let buffer = rawBuffer;
+  let reply = stateSnapshot.reply || "";
+  let finalPayload = stateSnapshot.finalPayload || null;
+  const chunks = buffer.split("\n\n");
+  if (!stateSnapshot.flush) {
+    buffer = chunks.pop() || "";
+  } else {
+    buffer = "";
+  }
+
+  for (const chunk of chunks) {
+    const parsed = parseSseEvent(chunk);
+    if (!parsed) {
+      continue;
+    }
+    if (parsed.event === "status") {
+      updateMessage(stateSnapshot.pendingMessageId, "", {
+        thinking: true,
+        thinkingLabel: parsed.data.label || "正在思考",
+      });
+      continue;
+    }
+    if (parsed.event === "meta") {
+      syncChatPayload(parsed.data);
+      continue;
+    }
+    if (parsed.event === "probe") {
+      const elapsedMs = Date.now() - (stateSnapshot.requestStartedAt || Date.now());
+      console.info("[taskmate] stream probe", {
+        stage: parsed.data.stage || "unknown",
+        elapsed_ms: elapsedMs,
+        hit_count: parsed.data.hit_count ?? null,
+      });
+      if (!reply && parsed.data.preview) {
+        updateMessage(stateSnapshot.pendingMessageId, parsed.data.preview);
+      }
+      continue;
+    }
+    if (parsed.event === "delta") {
+      reply += parsed.data.text || "";
+      updateMessage(stateSnapshot.pendingMessageId, reply);
+      continue;
+    }
+    if (parsed.event === "done") {
+      finalPayload = parsed.data;
+      continue;
+    }
+    if (parsed.event === "error") {
+      throw new Error(parsed.data.error || "流式请求失败");
+    }
+  }
+
+  return { buffer, reply, finalPayload };
+}
+
+function parseSseEvent(block) {
+  const lines = String(block || "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return null;
+  }
+  let event = "message";
+  const dataLines = [];
+  for (const line of lines) {
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+  const rawData = dataLines.join("\n");
+  if (!rawData) {
+    return null;
+  }
+  return {
+    event,
+    data: JSON.parse(rawData),
+  };
+}
+
+async function requestChatJson(message) {
+  const response = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(buildChatPayload(message)),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "Request failed");
+  }
+  return payload;
+}
+
+async function readErrorMessage(response) {
+  const rawText = await response.text();
+  try {
+    const payload = JSON.parse(rawText);
+    return payload.error || rawText || "Request failed";
+  } catch (_error) {
+    return rawText || "Request failed";
   }
 }
 

@@ -22,3 +22,27 @@ def test_finalize_text_marks_length_truncation() -> None:
     provider = OpenRouterChatProvider()
     text = provider._finalize_text("这是回答", {"finish_reason": "length"})
     assert "输出长度限制" in text
+
+
+def test_parse_stream_block_reads_json_payload() -> None:
+    provider = OpenRouterChatProvider()
+    payload = provider._parse_stream_block('event: message\ndata: {"choices":[{"delta":{"content":"你好"}}]}')
+    assert payload == {"choices": [{"delta": {"content": "你好"}}]}
+
+
+def test_extract_stream_text_reads_delta_content() -> None:
+    provider = OpenRouterChatProvider()
+    text = provider._extract_stream_text({"choices": [{"delta": {"content": [{"type": "text", "text": "流式片段"}]}}]})
+    assert text == "流式片段"
+
+
+def test_build_payload_disables_reasoning_for_streaming() -> None:
+    provider = OpenRouterChatProvider(api_key="test-key")
+    payload = provider._build_payload(
+        system_prompt="system",
+        user_message="user",
+        tools=None,
+        stream=True,
+    )
+    assert payload["stream"] is True
+    assert payload["reasoning"] == {"effort": "none", "exclude": True}

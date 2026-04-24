@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, AsyncIterator
 
 
 @dataclass(slots=True)
@@ -45,3 +45,13 @@ class ChatProviderBase(ABC):
         tools: list[ToolDefinition],
     ) -> ToolChatResponse:
         return ToolChatResponse(content=await self.chat(system_prompt=system_prompt, user_message=user_message))
+
+    async def chat_stream(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+    ) -> AsyncIterator[str]:
+        reply = await self.chat(system_prompt=system_prompt, user_message=user_message)
+        if reply:
+            yield reply

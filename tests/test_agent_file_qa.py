@@ -4,7 +4,7 @@ import base64
 from app.core.agent import AssistantAgent
 from app.core.models import ChatRequest
 from app.providers.embedding_remote import RemoteEmbeddingProvider
-from app.providers.llm_base import ChatProviderBase
+from app.providers.llm_base import ChatProviderBase, ToolChatResponse
 from app.services.d1_repo import InMemoryAppRepository
 from app.services.file_parser import FileParser
 from app.services.file_service import FileService
@@ -72,6 +72,23 @@ class NoEvidenceIdChatProvider(FakeChatProvider):
         self.system_prompt = system_prompt
         self.user_message = user_message
         return "这是一段归纳后的回答。"
+
+
+class ToolRoutingBypassChatProvider(FakeChatProvider):
+    def supports_tool_calls(self) -> bool:
+        return True
+
+    async def chat_with_tools(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        tools,
+    ) -> ToolChatResponse:
+        _ = system_prompt
+        _ = user_message
+        _ = tools
+        return ToolChatResponse(content="这是工具路由直接返回的普通回答。")
 
 
 def test_file_qa_uses_llm_to_summarize_retrieved_context(tmp_path) -> None:
@@ -251,5 +268,48 @@ def test_file_qa_without_evidence_ids_does_not_append_blind_citations(tmp_path) 
         )
         assert response.reply == "这是一段归纳后的回答。"
         assert "参考来源" not in response.reply
+
+    asyncio.run(run())
+
+
+def test_selected_file_summary_bypasses_router_plain_text_reply(tmp_path) -> None:
+    async def run() -> None:
+        repository = InMemoryAppRepository()
+        chat_provider = ToolRoutingBypassChatProvider()
+        qdrant = QdrantStore(storage_path=tmp_path / "vectors.json")
+        file_service = FileService(
+            repository=repository,
+            file_store=R2FileStore(tmp_path / "r2"),
+            file_parser=FileParser(),
+            embedding_provider=RemoteEmbeddingProvider(),
+            qdrant_store=qdrant,
+        )
+        uploaded = await file_service.upload_base64_file(
+            client_id="client_force_file_qa",
+            filename="agent-memory.txt",
+            content_type="text/plain",
+            content_base64=base64.b64encode(
+                b"Agent memory keeps short-term and long-term knowledge for multi-turn tasks."
+            ).decode("utf-8"),
+        )
+        agent = AssistantAgent(
+            repository=repository,
+            chat_provider=chat_provider,
+            search_service=SearchService(),
+            rag_service=RagService(
+                embedding_provider=RemoteEmbeddingProvider(),
+                qdrant_store=qdrant,
+            ),
+        )
+        response = await agent.handle_chat(
+            ChatRequest(
+                client_id="client_force_file_qa",
+                message="总结 agent-memory.docx",
+                file_ids=[uploaded["file"]["id"]],
+            )
+        )
+        assert response.intent.value == "file_qa"
+        assert response.reply.startswith("这是一段归纳后的回答。")
+        assert "工具路由直接返回的普通回答" not in response.reply
 
     asyncio.run(run())

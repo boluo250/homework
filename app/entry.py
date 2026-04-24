@@ -19,7 +19,7 @@ from app.core.http import HttpRequest, HttpResponse
 from app.providers.embedding_remote import RemoteEmbeddingProvider
 from app.providers.openrouter_chat import OpenRouterChatProvider
 from app.routes.admin import handle_admin_reset
-from app.routes.chat import handle_chat
+from app.routes.chat import handle_chat, handle_chat_stream
 from app.routes.files import handle_files
 from app.routes.research import handle_research
 from app.routes.tasks import handle_tasks
@@ -69,6 +69,13 @@ except ImportError:  # pragma: no cover
 
     class WorkerEntrypoint:  # pragma: no cover
         env: Any
+
+try:  # pragma: no cover
+    import js  # type: ignore
+    from pyodide.ffi import to_js as _to_js  # type: ignore
+except ImportError:  # pragma: no cover
+    js = None
+    _to_js = None
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -263,6 +270,8 @@ async def route_request(request: HttpRequest, container: AppContainer) -> HttpRe
         )
     if request.path == "/api/chat":
         return _with_cors(await handle_chat(request, container.agent))
+    if request.path == "/api/chat/stream":
+        return _with_cors(await handle_chat_stream(request, container.agent))
     if request.path == "/api/tasks":
         return _with_cors(
             await handle_tasks(
@@ -327,6 +336,8 @@ class Default(WorkerEntrypoint):
         )
         container = get_container(self.env)
         response = await route_request(http_request, container)
+        if response.stream_chunks and js is not None:
+            return await _build_streaming_response(response, ctx=getattr(self, "ctx", None))
         return Response(response.body, status=response.status, headers=response.headers)
 
     async def queue(self, batch, *_args: Any, **_kwargs: Any) -> None:
@@ -480,3 +491,42 @@ class Default(WorkerEntrypoint):
                             message.retry()
                 elif hasattr(message, "ack"):
                     message.ack()
+
+
+async def _build_streaming_response(response: HttpResponse, *, ctx=None):
+    stream = js.TransformStream.new()
+    writer = stream.writable.getWriter()
+
+    async def pump() -> None:
+        try:
+            stream_chunks = response.stream_chunks
+            if hasattr(stream_chunks, "__aiter__"):
+                async for chunk in stream_chunks:
+                    buffer = js.Uint8Array.new(len(chunk))
+                    buffer.assign(chunk)
+                    await writer.write(buffer)
+            else:
+                for chunk in stream_chunks or []:
+                    buffer = js.Uint8Array.new(len(chunk))
+                    buffer.assign(chunk)
+                    await writer.write(buffer)
+            await writer.close()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                await writer.abort(str(exc))
+            except Exception:  # noqa: BLE001
+                pass
+
+    import asyncio
+
+    pending = asyncio.create_task(pump())
+    wait_until = getattr(ctx, "waitUntil", None)
+    if callable(wait_until):
+        try:
+            wait_until(pending)
+        except Exception:  # noqa: BLE001
+            pass
+    response_init = {"status": response.status, "headers": response.headers}
+    if _to_js is not None:
+        response_init = _to_js(response_init)
+    return js.Response.new(stream.readable, response_init)
